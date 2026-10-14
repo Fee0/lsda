@@ -42,6 +42,9 @@ pub enum Error {
     /// EHABI requires [`ExceptionSpec::TypeInfos`](crate::write::ExceptionSpec::TypeInfos),
     /// the others [`ExceptionSpec::Types`](crate::write::ExceptionSpec::Types).
     ExceptionSpecMismatch,
+    /// An Arm EHABI exception specification lists a null `type_info`, which
+    /// would be read as the end of the list.
+    NullTypeInfo,
     /// An alignment is not a power of two.
     InvalidAlignment(u32),
     /// A write was attempted beyond the end of the section.
@@ -88,6 +91,9 @@ impl fmt::Display for Error {
             Error::InvalidSpecId => f.write_str("invalid exception specification id"),
             Error::ExceptionSpecMismatch => {
                 f.write_str("exception specification does not match the unwinder")
+            }
+            Error::NullTypeInfo => {
+                f.write_str("an Arm EHABI exception specification lists a null type_info")
             }
             Error::InvalidAlignment(alignment) => {
                 write!(f, "alignment {alignment} is not a power of two")

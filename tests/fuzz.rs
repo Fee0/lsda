@@ -11,7 +11,7 @@
 //!
 //! Set `LSDA_FUZZ_ITERATIONS` to run longer than the default.
 
-use lsda::read::{ActionOffset, GccExceptTable, Reader, SpecOffset};
+use lsda::read::{ActionOffset, GccExceptTable, Pointer, Reader, SpecOffset};
 use lsda::write::{self, Action, ActionId, Address, CallSite, EndianVec, EntryData, Filter};
 use lsda::write::{ExceptionSpec, LpStart, Lsda, SpecId, TypeId, Writer};
 use lsda::{BaseAddresses, Encoding, Format, LsdaOffset, RunTimeEndian, Unwinder};
@@ -188,7 +188,7 @@ fn random_encoding(rng: &mut Rng, fixed_size: bool) -> Encoding {
         &[0x00, 0x01, 0x02, 0x03, 0x04, 0x09, 0x0a, 0x0b, 0x0c]
     };
     let format = formats[rng.below(formats.len() as u64) as usize];
-    let application = [0x00, 0x10, 0x20, 0x30, 0x40][rng.below(5) as usize];
+    let application = [0x00, 0x10, 0x20, 0x30, 0x40, 0x50][rng.below(6) as usize];
     let indirect = if rng.chance(30) { 0x80 } else { 0 };
     Encoding(format | application | indirect)
 }
@@ -315,7 +315,6 @@ fn test_random_lsdas() {
         assert_eq!(tables.call_sites.len(), lsda.call_sites.len());
         assert_eq!(tables.actions.len(), lsda.actions.len());
         assert_eq!(tables.exception_specs.len(), lsda.exception_specs.len());
-        assert!(tables.types.len() >= lsda.types.len());
         for (read, written) in tables.call_sites.iter().zip(&lsda.call_sites) {
             if format.unwinder != Unwinder::SjLj {
                 assert_eq!((read.start, read.length), (written.start, written.length));
@@ -323,23 +322,17 @@ fn test_random_lsdas() {
             assert_eq!(read.landing_pad, written.landing_pad);
             assert_eq!(read.action.is_some(), written.action.is_some());
         }
-        // The type table entries before the written ones are padding.
-        let extra = tables.types.len() - lsda.types.len();
-        for (read, written) in tables.types[..lsda.types.len()].iter().zip(&lsda.types) {
+        // The referenced types read back as written. Entries beyond the
+        // written ones (read only for the Arm EHABI) are alignment padding.
+        let compared = tables.types.len().min(lsda.types.len());
+        for (read, written) in tables.types.iter().zip(&lsda.types) {
             let address = read.address(&bases).unwrap();
             match written {
-                Some(Address::Constant(value)) => {
-                    assert_eq!(address, value & mask(format));
-                }
+                Some(Address::Constant(value)) => assert_eq!(address, *value),
                 _ => assert!(read.is_null()),
             }
         }
-        assert!(
-            tables.types[lsda.types.len()..]
-                .iter()
-                .all(lsda::read::Pointer::is_null)
-        );
-        assert!(extra * 2 < lsda.type_table_alignment as usize);
+        assert!(tables.types[compared..].iter().all(Pointer::is_null));
 
         // It converts back to an LSDA that writes the same bytes.
         let (converted, ids) =
@@ -358,12 +351,4 @@ fn test_random_lsdas() {
         written > iterations / 4,
         "only {written} LSDAs were writable"
     );
-}
-
-fn mask(format: Format) -> u64 {
-    if format.address_size == 8 {
-        u64::MAX
-    } else {
-        (1 << (u32::from(format.address_size) * 8)) - 1
-    }
 }

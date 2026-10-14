@@ -234,7 +234,9 @@ pub(crate) fn write_constant_pointer<W: Writer + ?Sized>(
         w.align(u32::from(format.address_size))?;
     }
     let mask = format.address_mask();
-    let value = value & mask;
+    if value & !mask != 0 {
+        return Err(Error::PointerOutOfRange(value));
+    }
     if value == 0 {
         return write_raw(w, encoding, 0, size);
     }
@@ -324,6 +326,15 @@ mod tests {
         assert_eq!(
             write(0x02, 0x1_0000, 0, f8),
             Err(Error::PointerOutOfRange(0x1_0000))
+        );
+        // Addresses wider than the address size are not truncated.
+        assert_eq!(
+            write(0x00, 0x1_0000_0000, 0, f4),
+            Err(Error::PointerOutOfRange(0x1_0000_0000))
+        );
+        assert_eq!(
+            write(0x00, 0x1_0000_1000, 0, f4),
+            Err(Error::PointerOutOfRange(0x1_0000_1000))
         );
         assert_eq!(write(0x21, 0x480, 0, f8), Ok(alloc::vec![0x80, 0x01]));
         assert_eq!(write(0x19, 0xff0, 0, f8), Ok(alloc::vec![0x70]));

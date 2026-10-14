@@ -185,7 +185,9 @@ pub struct Lsda {
     pub call_site_encoding: Encoding,
     /// The alignment of the start of the type table, a power of two. GCC
     /// aligns it to the size of a type table entry, LLVM to 4. The type
-    /// table base offset is padded if necessary, as assemblers do.
+    /// table base offset is padded if necessary, as assemblers do. With a
+    /// `DW_EH_PE_aligned` type table encoding, the table is aligned to at
+    /// least the address size.
     pub type_table_alignment: u32,
     /// The call-site table, sorted by start offset for the DWARF and Arm
     /// EHABI unwinders.
@@ -313,8 +315,15 @@ impl Lsda {
     /// call-site value that does not fit its encoding,
     /// [`Error::InvalidActionId`], [`Error::InvalidTypeId`] or
     /// [`Error::InvalidSpecId`] for a dangling id,
-    /// [`Error::ExceptionSpecMismatch`], [`Error::InvalidAlignment`], and the
-    /// errors of [`Writer::write_pointer`].
+    /// [`Error::ExceptionSpecMismatch`], [`Error::NullTypeInfo`],
+    /// [`Error::InvalidAlignment`], and the errors of
+    /// [`Writer::write_pointer`].
+    ///
+    /// Every error is reported before anything is written, except those that
+    /// depend on where a pointer is written (a pc-relative displacement that
+    /// does not fit its format) and those of the writer itself (such as a
+    /// symbol address for a writer that does not record relocations). After
+    /// such an error, `w` may hold part of the LSDA.
     pub fn write<W: Writer>(&self, w: &mut W, format: Format, bases: &BaseAddresses) -> Result<()> {
         let arm = format.unwinder == Unwinder::ArmEhabi;
         let has_type_table = !self.ttype_encoding.is_omit();
@@ -329,11 +338,17 @@ impl Lsda {
         } else {
             0
         };
-        let type_table_alignment = check_alignment(self.type_table_alignment)?;
+        let mut type_table_alignment = check_alignment(self.type_table_alignment)?;
+        if self.ttype_encoding.application() == DW_EH_PE_ALIGNED {
+            // Each entry is aligned to the address size, so the table must
+            // start aligned for the entries to be where the base implies.
+            type_table_alignment = type_table_alignment.max(usize::from(format.address_size));
+        }
 
         let spec_offsets = self.spec_offsets(arm)?;
         let (actions, action_offsets) = self.encode_actions(w, &spec_offsets)?;
         let call_sites = self.encode_call_sites(w, format, &action_offsets)?;
+        self.check_pointers(format, bases)?;
 
         if let Some(lpstart) = self.lpstart {
             w.write_u8(lpstart.encoding.0)?;
@@ -377,7 +392,7 @@ impl Lsda {
             return Ok(());
         }
 
-        w.align(self.type_table_alignment)?;
+        w.align(type_table_alignment as u32)?;
         debug_assert_eq!(w.len(), types_start);
         for type_info in self.types.iter().rev() {
             let address = type_info.unwrap_or(Address::Constant(0));
@@ -404,6 +419,39 @@ impl Lsda {
         Ok(())
     }
 
+    /// Check the pointers for the errors that do not depend on where they are
+    /// written, so that they are reported before anything is written.
+    fn check_pointers(&self, format: Format, bases: &BaseAddresses) -> Result<()> {
+        let check = |encoding: Encoding, address: Address| -> Result<()> {
+            field_size(encoding, format)?;
+            if let Address::Constant(value) = address {
+                if value & !format.address_mask() != 0 {
+                    return Err(Error::PointerOutOfRange(value));
+                }
+                if value != 0 {
+                    bases
+                        .relative_base(encoding, 0)
+                        .map_err(Error::MissingBaseAddress)?;
+                }
+            }
+            Ok(())
+        };
+        if let Some(lpstart) = self.lpstart {
+            check(lpstart.encoding, lpstart.address)?;
+        }
+        for address in self.types.iter().flatten() {
+            check(self.ttype_encoding, *address)?;
+        }
+        for spec in &self.exception_specs {
+            if let ExceptionSpec::TypeInfos(type_infos) = spec {
+                for address in type_infos {
+                    check(Encoding::UDATA4, *address)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Return the offset of each exception specification: in bytes, or in
     /// entries for the Arm EHABI.
     fn spec_offsets(&self, arm: bool) -> Result<Vec<usize>> {
@@ -424,7 +472,13 @@ impl Lsda {
                         .sum::<usize>()
                         + 1
                 }
-                ExceptionSpec::TypeInfos(type_infos) if arm => type_infos.len() + 1,
+                ExceptionSpec::TypeInfos(type_infos) if arm => {
+                    // A null entry is the terminator.
+                    if type_infos.contains(&Address::Constant(0)) {
+                        return Err(Error::NullTypeInfo);
+                    }
+                    type_infos.len() + 1
+                }
                 _ => return Err(Error::ExceptionSpecMismatch),
             };
         }
@@ -514,11 +568,10 @@ impl Lsda {
         } else {
             self.call_site_encoding
         };
-        let size = field_size(encoding, format)
-            .map_err(|_| Error::UnsupportedCallSiteEncoding(encoding))?;
-        if encoding.application() != DW_EH_PE_ABSPTR {
+        if !encoding.is_offset_encoding() {
             return Err(Error::UnsupportedCallSiteEncoding(encoding));
         }
+        let size = field_size(encoding, format)?;
         let mut bytes = EndianVec::new(w.endian());
         let value = |bytes: &mut EndianVec<W::Endian>, value: u64| {
             if read_back(encoding, value, size) != value {
@@ -744,6 +797,98 @@ mod tests {
         lsda.write(&mut w, format, &BaseAddresses::default())
             .unwrap();
         assert_eq!(w.slice(), [0xff, 0xff, 0x01, 0x03, 0xac, 0x02, 0x00]);
+    }
+
+    #[test]
+    #[cfg(feature = "read")]
+    fn test_aligned_type_table() {
+        // DW_EH_PE_aligned entries are aligned to the address size, so the
+        // table is too, whatever the start offset.
+        let mut lsda = Lsda::new();
+        lsda.ttype_encoding = Encoding(DW_EH_PE_ALIGNED);
+        let ty = lsda.add_type(Some(Address::Constant(0x1234)));
+        let spec = lsda.add_exception_spec(ExceptionSpec::Types(alloc::vec![ty]));
+        let action = lsda.add_action(Action {
+            filter: Filter::ExceptionSpec(spec),
+            next: None,
+        });
+        lsda.call_sites.push(CallSite {
+            start: 0,
+            length: 4,
+            landing_pad: 8,
+            action: Some(action),
+        });
+        for start in 0..8 {
+            let mut w = EndianVec::new(LittleEndian);
+            w.write(&alloc::vec![0; start]).unwrap();
+            lsda.write(&mut w, Format::new(8), &BaseAddresses::default())
+                .unwrap();
+            let table = read::GccExceptTable::new(w.slice(), LittleEndian, Format::new(8));
+            let parsed = table.lsda_at(LsdaOffset(start)).unwrap();
+            assert_eq!(
+                parsed.type_entry(1).unwrap().value(),
+                0x1234,
+                "start {start}"
+            );
+            let tables = parsed.parse_tables().unwrap();
+            assert_eq!(
+                tables.exception_specs[0].entries,
+                [read::SpecEntry::Type(1)],
+                "start {start}"
+            );
+            assert_eq!(tables.end, w.len());
+        }
+    }
+
+    #[test]
+    fn test_errors_before_writing() {
+        let bases = BaseAddresses::default();
+        let mut w = EndianVec::new(LittleEndian);
+
+        // A missing base address for @LPStart.
+        let mut lsda = Lsda::new();
+        lsda.lpstart = Some(LpStart {
+            encoding: Encoding::PCREL_SDATA4,
+            address: Address::Constant(0x10),
+        });
+        assert_eq!(
+            lsda.write(&mut w, Format::new(8), &bases),
+            Err(Error::MissingBaseAddress(crate::Base::Section))
+        );
+
+        // A null Arm EHABI type_info would terminate the list.
+        let mut lsda = Lsda::new();
+        lsda.ttype_encoding = Encoding::ABSPTR;
+        lsda.add_exception_spec(ExceptionSpec::TypeInfos(alloc::vec![
+            Address::Constant(0),
+            Address::Constant(0x100),
+        ]));
+        assert_eq!(
+            lsda.write(&mut w, Format::arm_ehabi(), &bases),
+            Err(Error::NullTypeInfo)
+        );
+
+        // An address wider than the address size.
+        let mut lsda = Lsda::new();
+        lsda.ttype_encoding = Encoding::UDATA4;
+        lsda.add_type(Some(Address::Constant(0x1_0000_0000)));
+        assert_eq!(
+            lsda.write(&mut w, Format::new(4), &bases),
+            Err(Error::PointerOutOfRange(0x1_0000_0000))
+        );
+
+        // An indirect call-site encoding, and an unsupported address size.
+        let mut lsda = Lsda::new();
+        lsda.call_site_encoding = Encoding(0x83);
+        assert_eq!(
+            lsda.write(&mut w, Format::new(8), &bases),
+            Err(Error::UnsupportedCallSiteEncoding(Encoding(0x83)))
+        );
+        assert_eq!(
+            Lsda::new().write(&mut w, Format::new(3), &bases),
+            Err(Error::UnsupportedAddressSize(3))
+        );
+        assert_eq!(w.len(), 0);
     }
 
     #[test]

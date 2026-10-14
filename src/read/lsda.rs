@@ -2,7 +2,6 @@ use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
 use crate::common::{ARM_SPEC_ENTRY_SIZE, Encoding, Format, LsdaOffset, Unwinder};
-use crate::constants::DW_EH_PE_ABSPTR;
 use crate::endianity::Endianity;
 use crate::read::{EndianSlice, Error, Pointer, Reader, Result, read_pointer, target2_pointer};
 
@@ -67,7 +66,7 @@ impl<R: Reader> GccExceptTable<R> {
     /// the section or the type table base is beyond its end,
     /// [`Error::InvalidEncoding`] for an undefined pointer encoding,
     /// [`Error::UnsupportedCallSiteEncoding`] for a call-site encoding that
-    /// is not an offset, and [`Error::UnexpectedEof`] if the header or the
+    /// is not a plain offset (it has an application or is indirect), and [`Error::UnexpectedEof`] if the header or the
     /// call-site table is truncated.
     pub fn lsda_at(&self, offset: LsdaOffset) -> Result<Lsda<R>> {
         Lsda::parse(&self.section, offset, self.format)
@@ -133,10 +132,7 @@ impl<R: Reader> Lsda<R> {
         let call_site_encoding = Encoding(input.read_u8()?);
         // The SJLJ personality reads its call-site table as ULEB128 values
         // whatever the encoding byte says.
-        if format.unwinder != Unwinder::SjLj
-            && (!call_site_encoding.is_valid()
-                || call_site_encoding.application() != DW_EH_PE_ABSPTR)
-        {
+        if format.unwinder != Unwinder::SjLj && !call_site_encoding.is_offset_encoding() {
             return Err(Error::UnsupportedCallSiteEncoding(call_site_encoding));
         }
         let len = input.read_uleb128()?;
@@ -374,16 +370,20 @@ impl<R: Reader> Lsda<R> {
     /// * the action table holds the records reachable from the call sites,
     ///   read in sequence from its start (unreferenced records between them
     ///   are included);
-    /// * the type table holds the whole entries between the end of the
-    ///   action table and the type table base (padding is smaller than an
-    ///   entry), or more if an action or exception specification refers to
-    ///   a higher index;
+    /// * the type table holds as many entries as the highest index referenced
+    ///   by an action or exception specification. For the Arm EHABI, where
+    ///   LLVM also lists the types of exception specifications, which are not
+    ///   referenced by index, it holds at least the whole entries between the
+    ///   end of the action table and the type table base (padding is smaller
+    ///   than an entry);
     /// * the exception specification table holds the lists referenced by
     ///   the actions, read in sequence from the type table base.
     ///
     /// # Errors
     ///
     /// Returns the errors of the individual table accessors,
+    /// [`Error::MissingTypeTable`] if an action refers to a type or an
+    /// exception specification but there is no type table,
     /// [`Error::ActionCycle`] for a chain of actions that does not end, and
     /// [`Error::MisalignedAction`] or [`Error::MisalignedExceptionSpec`] if
     /// a referenced record or list is not where reading the table in
@@ -395,45 +395,7 @@ impl<R: Reader> Lsda<R> {
             call_sites.push(call_site);
         }
 
-        // Every record reachable from a call site.
-        let mut reachable = BTreeSet::new();
-        for call_site in &call_sites {
-            let Some(first) = call_site.action else {
-                continue;
-            };
-            if reachable.contains(&first) {
-                continue;
-            }
-            // A record seen earlier in this chain is a cycle; one seen in
-            // another chain is a shared tail, which is already visited.
-            let mut chain = self.actions(first);
-            let mut visited = BTreeSet::new();
-            while let Some(action) = chain.next()? {
-                if !visited.insert(action.offset) {
-                    return Err(Error::ActionCycle);
-                }
-                if !reachable.insert(action.offset) {
-                    break;
-                }
-            }
-        }
-
-        // Read the action table in sequence up to the last reachable record.
-        let mut actions = Vec::new();
-        let mut starts = BTreeSet::new();
-        let mut offset = 0;
-        if let Some(last) = reachable.last() {
-            while offset <= last.0 {
-                let action = self.action_at(ActionOffset(offset))?;
-                offset += action.len;
-                starts.insert(action.offset);
-                actions.push(action);
-            }
-        }
-        if let Some(missing) = reachable.difference(&starts).next() {
-            return Err(Error::MisalignedAction(missing.0));
-        }
-        let action_table_end = self.action_table_offset() + offset;
+        let (actions, action_table_end) = self.parse_action_table(&call_sites)?;
 
         let mut type_count = 0;
         let mut spec_offsets = BTreeSet::new();
@@ -445,6 +407,10 @@ impl<R: Reader> Lsda<R> {
                     spec_offsets.insert(offset);
                 }
             }
+        }
+
+        if !spec_offsets.is_empty() && self.ttype_base.is_none() {
+            return Err(Error::MissingTypeTable);
         }
 
         // Read the exception specification table in sequence up to the last
@@ -480,9 +446,11 @@ impl<R: Reader> Lsda<R> {
         }
 
         // Producers emit only referenced types, except that LLVM also lists
-        // the types of Arm EHABI exception specifications. Take the table to
+        // the types of Arm EHABI exception specifications, which refer to
+        // `type_info` objects directly. For the Arm EHABI, take the table to
         // fill the space after the action table, less padding.
-        if let Ok((base, size)) = self.type_table()
+        if self.format.unwinder == Unwinder::ArmEhabi
+            && let Ok((base, size)) = self.type_table()
             && let Some(space) = base.checked_sub(action_table_end)
         {
             type_count = type_count.max((space / size) as u64);
@@ -507,6 +475,51 @@ impl<R: Reader> Lsda<R> {
             exception_specs,
             end,
         })
+    }
+
+    /// Read the action table: the records reachable from `call_sites`, in
+    /// sequence from the start of the table. Return them and the section
+    /// offset of the end of the table.
+    fn parse_action_table(&self, call_sites: &[CallSite]) -> Result<(Vec<Action>, usize)> {
+        // Every record reachable from a call site.
+        let mut reachable = BTreeSet::new();
+        for call_site in call_sites {
+            let Some(first) = call_site.action else {
+                continue;
+            };
+            if reachable.contains(&first) {
+                continue;
+            }
+            // A record seen earlier in this chain is a cycle; one seen in
+            // another chain is a shared tail, which is already visited.
+            let mut chain = self.actions(first);
+            let mut visited = BTreeSet::new();
+            while let Some(action) = chain.next()? {
+                if !visited.insert(action.offset) {
+                    return Err(Error::ActionCycle);
+                }
+                if !reachable.insert(action.offset) {
+                    break;
+                }
+            }
+        }
+
+        // Read the action table in sequence up to the last reachable record.
+        let mut actions = Vec::new();
+        let mut starts = BTreeSet::new();
+        let mut offset = 0;
+        if let Some(last) = reachable.last() {
+            while offset <= last.0 {
+                let action = self.action_at(ActionOffset(offset))?;
+                offset += action.len;
+                starts.insert(action.offset);
+                actions.push(action);
+            }
+        }
+        if let Some(missing) = reachable.difference(&starts).next() {
+            return Err(Error::MisalignedAction(missing.0));
+        }
+        Ok((actions, self.action_table_offset() + offset))
     }
 }
 
@@ -996,6 +1009,35 @@ mod tests {
     }
 
     #[test]
+    fn test_unreferenced_bytes_before_types() {
+        // Unreferenced bytes after the last action record are not types,
+        // except for the Arm EHABI, where LLVM lists unreferenced types.
+        let data = [
+            0xff, 0x03, 0x14, 0x01, 0x04, // header, base at 0x17
+            0x00, 0x04, 0x00, 0x01, // call site
+            0x01, 0x00, // action: catch type 1
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // unreferenced
+            0x00, 0x10, 0x00, 0x00, // type 1
+        ];
+        let table = GccExceptTable::new(&data, LittleEndian, Format::new(4));
+        let tables = table
+            .lsda_at(LsdaOffset(0))
+            .unwrap()
+            .parse_tables()
+            .unwrap();
+        assert_eq!(tables.types.len(), 1);
+        assert_eq!(tables.types[0].value(), 0x1000);
+
+        let table = GccExceptTable::new(&data, LittleEndian, Format::arm_ehabi());
+        let tables = table
+            .lsda_at(LsdaOffset(0))
+            .unwrap()
+            .parse_tables()
+            .unwrap();
+        assert_eq!(tables.types.len(), 3);
+    }
+
+    #[test]
     fn test_sjlj() {
         let data = [
             0xff, 0xff, 0x01, 0x04, // header without a type table
@@ -1055,6 +1097,18 @@ mod tests {
             GccExceptTable::new(&[0xff], LittleEndian, Format::new(3)).lsda_at(LsdaOffset(0)),
             Err(Error::UnsupportedAddressSize(3))
         );
+
+        // An indirect call-site encoding: libgcc would dereference offsets.
+        assert_eq!(
+            parse(&[0xff, 0xff, 0x83, 0x00]),
+            Err(Error::UnsupportedCallSiteEncoding(Encoding(0x83)))
+        );
+
+        // An exception specification without a type table.
+        let data = [0xff, 0xff, 0x01, 0x04, 0x00, 0x04, 0x00, 0x01, 0x7f, 0x00];
+        let table = GccExceptTable::new(&data, LittleEndian, Format::new(8));
+        let lsda = table.lsda_at(LsdaOffset(0)).unwrap();
+        assert_eq!(lsda.parse_tables(), Err(Error::MissingTypeTable));
 
         // An action that points to itself.
         let data = [0xff, 0xff, 0x01, 0x04, 0x00, 0x04, 0x00, 0x01, 0x00, 0x7f];

@@ -95,6 +95,16 @@ impl Encoding {
             && self.application() <= DW_EH_PE_ALIGNED
     }
 
+    /// Return true if call-site table values can use this encoding: a valid
+    /// encoding with the `DW_EH_PE_absptr` application and no indirection.
+    ///
+    /// The personality routine reads call-site values as plain offsets, with
+    /// no base address; libgcc would still follow an indirect value.
+    #[cfg(any(feature = "read", feature = "write"))]
+    pub(crate) fn is_offset_encoding(self) -> bool {
+        self.is_valid() && self.application() == DW_EH_PE_ABSPTR && !self.is_indirect()
+    }
+
     /// Return the size in bytes of a value in this encoding, or `None` if it
     /// is variable (LEB128) or the encoding is invalid.
     ///

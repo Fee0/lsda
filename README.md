@@ -196,10 +196,12 @@ relocations of an object file allow) and exception specifications.
   `.ARM.extab`; the caller provides the offset of each LSDA.
 - **Inferred extent.** The lengths of the action, type and exception
   specification tables are not recorded. `parse_tables` reads the action
-  records reachable from the call sites and the exception specifications they
-  reference, and takes the type table to fill the space between the action
-  table and the type table base. Data that no call site refers to, which
-  GCC and LLVM never emit, is not decoded.
+  records reachable from the call sites, the exception specifications they
+  reference, and the type table up to the highest referenced index. For the
+  Arm EHABI, where LLVM also lists types that are not referenced by index,
+  the type table fills the space between the action table and its base. Data
+  that nothing refers to, which GCC and LLVM never emit otherwise, is not
+  decoded (`from_read` still keeps it, so round trips stay lossless).
 - **Round-trip conditions.** `from_read` converts an LSDA only if writing it
   reproduces its bytes exactly, and keeps it as raw bytes otherwise: for
   example with a non-minimal LEB128 value outside the `@TType` base offset,

@@ -207,9 +207,10 @@ fn convert_lsda<R: Reader>(
                 referenced_types = referenced_types.max(index as usize);
                 Filter::Catch(type_id(index))
             }
-            read::Filter::ExceptionSpec(offset) => {
-                Filter::ExceptionSpec(spec_id(offset).ok_or(Error::InvalidSpecId)?)
-            }
+            read::Filter::ExceptionSpec(offset) => match spec_id(offset) {
+                Some(id) => Filter::ExceptionSpec(id),
+                None => return Ok(None),
+            },
         };
         let next = match action.next {
             Some(offset) => match action_id(offset) {
@@ -225,7 +226,10 @@ fn convert_lsda<R: Reader>(
     let mut call_sites = Vec::with_capacity(tables.call_sites.len());
     for call_site in &tables.call_sites {
         let action = match call_site.action {
-            Some(offset) => Some(action_id(offset).ok_or(Error::InvalidActionId)?),
+            Some(offset) => match action_id(offset) {
+                Some(id) => Some(id),
+                None => return Ok(None),
+            },
             None => None,
         };
         call_sites.push(CallSite {
@@ -285,6 +289,19 @@ fn convert_lsda<R: Reader>(
             return Ok(None);
         };
         let action_end = tables.action_table_end;
+        // The table may hold entries that nothing refers to, between the
+        // action table and the referenced entries.
+        let available = base.saturating_sub(action_end) / size;
+        for index in types.len() + 1..=available {
+            let Ok(pointer) = lsda.type_entry(index as u64) else {
+                return Ok(None);
+            };
+            types.push(if pointer.is_null() {
+                None
+            } else {
+                Some(constant(pointer)?)
+            });
+        }
         for count in (referenced_types..=types.len()).rev() {
             if types[count..].iter().any(Option::is_some) {
                 break;
@@ -440,6 +457,41 @@ mod tests {
         assert_eq!(table.entries().len(), 2);
         assert!(matches!(&table.entries()[0].data, EntryData::Raw(raw) if raw == &[0xaa, 0xbb]));
         assert!(matches!(&table.entries()[1].data, EntryData::Raw(raw) if raw.len() == 11));
+    }
+
+    #[test]
+    fn test_malformed_lsda_is_raw() {
+        // An exception specification without a type table.
+        let data = [0xff, 0xff, 0x01, 0x04, 0x00, 0x04, 0x00, 0x01, 0x7f, 0x00];
+        let table = roundtrip(&data, &[0], Format::new(8));
+        assert!(matches!(&table.entries()[0].data, EntryData::Raw(raw) if raw == &data));
+    }
+
+    #[test]
+    fn test_unreferenced_types() {
+        // A type table entry that no action refers to is kept.
+        let mut lsda = Lsda::new();
+        lsda.ttype_encoding = crate::Encoding::UDATA4;
+        let used = lsda.add_type(Some(Address::Constant(0x100)));
+        lsda.add_type(Some(Address::Constant(0x200)));
+        let action = lsda.add_action(Action {
+            filter: Filter::Catch(used),
+            next: None,
+        });
+        lsda.call_sites.push(CallSite {
+            start: 0,
+            length: 4,
+            landing_pad: 8,
+            action: Some(action),
+        });
+        let mut w = EndianVec::new(LittleEndian);
+        lsda.write(&mut w, Format::new(4), &BaseAddresses::default())
+            .unwrap();
+        let table = roundtrip(w.slice(), &[0], Format::new(4));
+        let EntryData::Lsda(converted) = &table.entries()[0].data else {
+            panic!("expected an LSDA");
+        };
+        assert_eq!(converted, &lsda);
     }
 
     #[test]
