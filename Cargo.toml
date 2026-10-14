@@ -50,6 +50,10 @@ required-features = ["read", "write"]
 name = "fuzz"
 required-features = ["read", "write"]
 
+[[test]]
+name = "oracle"
+required-features = ["read", "write"]
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)"] }
 

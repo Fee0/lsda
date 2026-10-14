@@ -77,8 +77,15 @@ impl Encoding {
 
     /// Return true if this is not `DW_EH_PE_omit` and both the format and
     /// the application are defined.
+    ///
+    /// `DW_EH_PE_aligned` is valid only on its own, as GCC emits and libgcc
+    /// reads it: libgcc reads any other combination as the plain format,
+    /// unaligned, and libc++abi does not support it at all.
     #[must_use]
     pub fn is_valid(self) -> bool {
+        if self.application() == DW_EH_PE_ALIGNED {
+            return self.0 == DW_EH_PE_ALIGNED;
+        }
         !self.is_omit()
             && matches!(
                 self.format(),
@@ -92,7 +99,7 @@ impl Encoding {
                     | DW_EH_PE_SDATA4
                     | DW_EH_PE_SDATA8
             )
-            && self.application() <= DW_EH_PE_ALIGNED
+            && self.application() < DW_EH_PE_ALIGNED
     }
 
     /// Return true if call-site table values can use this encoding: a valid
@@ -141,6 +148,9 @@ impl fmt::Display for Encoding {
         if !self.is_valid() {
             return write!(f, "<invalid encoding 0x{:02x}>", self.0);
         }
+        if self.0 == DW_EH_PE_ALIGNED {
+            return f.write_str("DW_EH_PE_aligned");
+        }
         let format = match self.format() {
             DW_EH_PE_ABSPTR => "absptr",
             DW_EH_PE_ULEB128 => "uleb128",
@@ -160,7 +170,6 @@ impl fmt::Display for Encoding {
             DW_EH_PE_TEXTREL => f.write_str("DW_EH_PE_textrel|")?,
             DW_EH_PE_DATAREL => f.write_str("DW_EH_PE_datarel|")?,
             DW_EH_PE_FUNCREL => f.write_str("DW_EH_PE_funcrel|")?,
-            DW_EH_PE_ALIGNED => f.write_str("DW_EH_PE_aligned|")?,
             _ => {}
         }
         write!(f, "DW_EH_PE_{format}")
@@ -245,18 +254,23 @@ impl Format {
         size_mask(self.address_size)
     }
 
-    /// Return true if the address size is supported: 2, 4 or 8.
+    /// Return true if the address size is supported: 2, 4 or 8, and 4 for
+    /// the Arm EHABI, which is only used by 32-bit Arm.
     #[cfg(any(feature = "read", feature = "write"))]
     #[inline]
     pub(crate) fn has_valid_address_size(self) -> bool {
-        matches!(self.address_size, 2 | 4 | 8)
+        match self.unwinder {
+            Unwinder::ArmEhabi => self.address_size == 4,
+            _ => matches!(self.address_size, 2 | 4 | 8),
+        }
     }
 }
 
-/// The size of an Arm EHABI exception specification entry: a `_uleb128_t`,
-/// which is a 32-bit word in libgcc's Arm unwinder.
+/// The size of an Arm EHABI `R_ARM_TARGET2` word. The personality routines
+/// read type table entries and exception specification entries as these
+/// words, whatever the `@TType` encoding.
 #[cfg(any(feature = "read", feature = "write"))]
-pub(crate) const ARM_SPEC_ENTRY_SIZE: u8 = 4;
+pub(crate) const ARM_TARGET2_SIZE: u8 = 4;
 
 /// Return a mask of the low `size` bytes.
 #[cfg(any(feature = "read", feature = "write"))]
@@ -417,6 +431,10 @@ mod tests {
         assert_eq!(Encoding::ABSPTR.size(8), Some(8));
         assert_eq!(Encoding::ULEB128.size(8), None);
         assert_eq!(Encoding(DW_EH_PE_ALIGNED).size(4), Some(4));
+        assert_eq!(Encoding(DW_EH_PE_ALIGNED).to_string(), "DW_EH_PE_aligned");
+        // libgcc reads these as unaligned udata4 and indirect absptr.
+        assert!(!Encoding(DW_EH_PE_ALIGNED | DW_EH_PE_UDATA4).is_valid());
+        assert!(!Encoding(DW_EH_PE_ALIGNED | DW_EH_PE_INDIRECT).is_valid());
         assert!(!Encoding::OMIT.is_valid());
         assert!(!Encoding(0x05).is_valid());
         assert!(!Encoding(0x60).is_valid());

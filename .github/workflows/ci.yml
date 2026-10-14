@@ -38,6 +38,20 @@ jobs:
           toolchain: ${{ matrix.rust }}
       - run: cargo test --all-features
 
+  oracle:
+    name: Differential test against libstdc++
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+      - run: sh tests/oracle/build.sh target/oracle
+      - run: cargo test --release --test oracle -- --nocapture
+        env:
+          LSDA_ORACLE64: target/oracle/oracle64
+          LSDA_ORACLE32: target/oracle/oracle32
+          LSDA_ORACLE_ITERATIONS: "200000"
+
   features:
     name: Feature combinations
     runs-on: ubuntu-latest

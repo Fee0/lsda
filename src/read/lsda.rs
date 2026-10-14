@@ -1,7 +1,8 @@
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
-use crate::common::{ARM_SPEC_ENTRY_SIZE, Encoding, Format, LsdaOffset, Unwinder};
+use crate::common::{ARM_TARGET2_SIZE, Encoding, Format, LsdaOffset, Unwinder, size_mask};
+use crate::constants::DW_EH_PE_ALIGNED;
 use crate::endianity::Endianity;
 use crate::read::{EndianSlice, Error, Pointer, Reader, Result, read_pointer, target2_pointer};
 
@@ -62,12 +63,13 @@ impl<R: Reader> GccExceptTable<R> {
     /// # Errors
     ///
     /// Returns [`Error::UnsupportedAddressSize`] if the format's address size
-    /// is not 2, 4 or 8, [`Error::OffsetOutOfBounds`] if `offset` is outside
-    /// the section or the type table base is beyond its end,
-    /// [`Error::InvalidEncoding`] for an undefined pointer encoding,
+    /// is not 2, 4 or 8 (4 for the Arm EHABI), [`Error::OffsetOutOfBounds`]
+    /// if `offset` is outside the section or the type table base is beyond
+    /// its end, [`Error::InvalidEncoding`] for an undefined pointer encoding,
     /// [`Error::UnsupportedCallSiteEncoding`] for a call-site encoding that
-    /// is not a plain offset (it has an application or is indirect), and [`Error::UnexpectedEof`] if the header or the
-    /// call-site table is truncated.
+    /// is not a plain offset (it has an application or is indirect), and
+    /// [`Error::UnexpectedEof`] if the header or the call-site table is
+    /// truncated.
     pub fn lsda_at(&self, offset: LsdaOffset) -> Result<Lsda<R>> {
         Lsda::parse(&self.section, offset, self.format)
     }
@@ -216,8 +218,11 @@ impl<R: Reader> Lsda<R> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::MissingTypeTable`] if there is no type table, and
-    /// [`Error::VariableSizeTypeEncoding`] if the encoding has no fixed size.
+    /// Returns [`Error::MissingTypeTable`] if there is no type table,
+    /// [`Error::VariableSizeTypeEncoding`] if the encoding has no fixed size,
+    /// and [`Error::InvalidEncoding`] for the Arm EHABI if the size is not 4
+    /// or the encoding is `DW_EH_PE_aligned`: its personality routines read
+    /// 4-byte `R_ARM_TARGET2` words in place.
     pub fn ttype_entry_size(&self) -> Result<usize> {
         self.type_table().map(|(_, size)| size)
     }
@@ -229,6 +234,13 @@ impl<R: Reader> Lsda<R> {
             .ttype_encoding
             .size(self.format.address_size)
             .ok_or(Error::VariableSizeTypeEncoding(self.ttype_encoding))?;
+        // The Arm EHABI personality routines read `R_ARM_TARGET2` words in
+        // place, whatever the encoding says.
+        if self.format.unwinder == Unwinder::ArmEhabi
+            && (size != ARM_TARGET2_SIZE || self.ttype_encoding.0 == DW_EH_PE_ALIGNED)
+        {
+            return Err(Error::InvalidEncoding(self.ttype_encoding));
+        }
         Ok((base, usize::from(size)))
     }
 
@@ -311,7 +323,9 @@ impl<R: Reader> Lsda<R> {
     /// Returns [`Error::InvalidTypeIndex`] for index 0,
     /// [`Error::MissingTypeTable`] if there is no type table,
     /// [`Error::VariableSizeTypeEncoding`] if the encoding has no fixed size,
-    /// and [`Error::OffsetOutOfBounds`] if the entry is before the section.
+    /// [`Error::InvalidEncoding`] for an Arm EHABI encoding whose size is not
+    /// 4 or that is `DW_EH_PE_aligned`, and [`Error::OffsetOutOfBounds`] if
+    /// the entry is before the section.
     pub fn type_entry(&self, index: u64) -> Result<Pointer> {
         if index == 0 {
             return Err(Error::InvalidTypeIndex);
@@ -346,7 +360,7 @@ impl<R: Reader> Lsda<R> {
         let base = self.ttype_base.ok_or(Error::MissingTypeTable)?;
         let arm = self.format.unwinder == Unwinder::ArmEhabi;
         let delta = if arm {
-            offset.0.checked_mul(usize::from(ARM_SPEC_ENTRY_SIZE))
+            offset.0.checked_mul(usize::from(ARM_TARGET2_SIZE))
         } else {
             Some(offset.0)
         };
@@ -435,7 +449,7 @@ impl<R: Reader> Lsda<R> {
                 spec_end = Some(end);
                 let len = end - base;
                 offset = SpecOffset(if iter.arm {
-                    len / usize::from(ARM_SPEC_ENTRY_SIZE)
+                    len / usize::from(ARM_TARGET2_SIZE)
                 } else {
                     len
                 });
@@ -557,8 +571,11 @@ impl<R: Reader> CallSiteIter<R> {
     /// # Errors
     ///
     /// Returns [`Error::UnexpectedEof`] if the table ends within an entry,
-    /// and [`Error::OffsetOutOfBounds`] if the action does not fit in a
-    /// `usize`. After an error, the iterator returns `Ok(None)`.
+    /// [`Error::CallSiteOutOfRange`] if the end of the region is beyond the
+    /// address space (the personality routine's address arithmetic would
+    /// wrap around, and never match it), and [`Error::OffsetOutOfBounds`] if
+    /// the action does not fit in a `usize`. After an error, the iterator
+    /// returns `Ok(None)`.
     pub fn next(&mut self) -> Result<Option<CallSite>> {
         if self.input.is_empty() {
             return Ok(None);
@@ -577,8 +594,10 @@ impl<R: Reader> CallSiteIter<R> {
 
     fn parse(&mut self) -> Result<CallSite> {
         let offset = self.input.offset_from(&self.section);
+        // The personality routine holds the values in address-sized words.
+        let mask = size_mask(self.format.address_size);
         let (start, length, landing_pad) = if self.format.unwinder == Unwinder::SjLj {
-            (0, 0, self.input.read_uleb128()?)
+            (0, 0, self.input.read_uleb128()? & mask)
         } else {
             let mut value = || {
                 read_pointer(
@@ -587,10 +606,13 @@ impl<R: Reader> CallSiteIter<R> {
                     self.encoding,
                     self.format.address_size,
                 )
-                .map(|pointer| pointer.value())
+                .map(|pointer| pointer.value() & mask)
             };
             (value()?, value()?, value()?)
         };
+        if length > mask - start {
+            return Err(Error::CallSiteOutOfRange(offset));
+        }
         let action = match self.input.read_uleb128()? {
             0 => None,
             action => Some(ActionOffset(
@@ -619,6 +641,10 @@ pub struct CallSite {
     pub index: u64,
     /// The start of the code region, as an offset from the start of the
     /// function. Always 0 for the SJLJ unwinder.
+    ///
+    /// Call-site values are truncated to the address size, as the
+    /// personality routine reads them, and the region ends within the
+    /// address space.
     pub start: u64,
     /// The length of the code region. Always 0 for the SJLJ unwinder.
     pub length: u64,
@@ -839,7 +865,7 @@ impl<R: Reader> ExceptionSpecIter<R> {
     fn parse(&mut self) -> Result<Option<SpecEntry>> {
         let offset = self.offset();
         if self.arm {
-            match self.input.read_relocatable(ARM_SPEC_ENTRY_SIZE)? {
+            match self.input.read_relocatable(ARM_TARGET2_SIZE)? {
                 0 => Ok(None),
                 value => Ok(Some(SpecEntry::TypeInfo(target2_pointer(offset, value)))),
             }
@@ -1124,5 +1150,43 @@ mod tests {
         let table = GccExceptTable::new(&data, LittleEndian, Format::new(8));
         let lsda = table.lsda_at(LsdaOffset(0)).unwrap();
         assert_eq!(lsda.parse_tables(), Err(Error::MisalignedAction(1)));
+
+        // The Arm EHABI is 32-bit.
+        let arm8 = Format::new(8).with_unwinder(Unwinder::ArmEhabi);
+        assert_eq!(
+            GccExceptTable::new(&[0xff], LittleEndian, arm8).lsda_at(LsdaOffset(0)),
+            Err(Error::UnsupportedAddressSize(8))
+        );
+
+        // Arm EHABI type table entries are 4-byte words read in place.
+        for encoding in [0x04, 0x02, 0x50] {
+            let data = [0xff, encoding, 0x08, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
+            let table = GccExceptTable::new(&data, LittleEndian, Format::arm_ehabi());
+            let lsda = table.lsda_at(LsdaOffset(0)).unwrap();
+            assert_eq!(
+                lsda.type_entry(1),
+                Err(Error::InvalidEncoding(Encoding(encoding)))
+            );
+        }
+
+        // Call-site values are truncated to the address size, and a region
+        // must end within the address space.
+        let data = [
+            0xff, 0xff, 0x0b, 0x0d, 0xf0, 0xff, 0xff, 0xff, 0x0f, 0, 0, 0, 0, 0, 0, 0, 0x00,
+        ];
+        let table = GccExceptTable::new(&data, LittleEndian, Format::new(4));
+        let call_site = table
+            .lsda_at(LsdaOffset(0))
+            .unwrap()
+            .find_call_site(0xffff_fff8);
+        assert_eq!(call_site.unwrap().unwrap().start, 0xffff_fff0);
+        let data = [
+            0xff, 0xff, 0x0b, 0x0d, 0xf0, 0xff, 0xff, 0xff, 0x10, 0, 0, 0, 0, 0, 0, 0, 0x00,
+        ];
+        let table = GccExceptTable::new(&data, LittleEndian, Format::new(4));
+        assert_eq!(
+            table.lsda_at(LsdaOffset(0)).unwrap().find_call_site(0),
+            Err(Error::CallSiteOutOfRange(4))
+        );
     }
 }

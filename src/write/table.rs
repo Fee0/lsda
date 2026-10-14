@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use crate::common::{ARM_SPEC_ENTRY_SIZE, padding};
+use crate::common::{ARM_TARGET2_SIZE, padding};
 use crate::common::{BaseAddresses, Encoding, Format, LsdaOffset, Unwinder};
 use crate::constants::*;
 use crate::leb128;
@@ -310,9 +310,12 @@ impl Lsda {
     ///
     /// Returns [`Error::MissingTypeTable`] if there are types or exception
     /// specifications without a type table encoding,
-    /// [`Error::VariableSizeTypeEncoding`],
+    /// [`Error::VariableSizeTypeEncoding`], [`Error::InvalidEncoding`] for an
+    /// Arm EHABI `@TType` encoding whose size is not 4 or that is
+    /// `DW_EH_PE_aligned`,
     /// [`Error::UnsupportedCallSiteEncoding`], [`Error::ValueOutOfRange`] for a
-    /// call-site value that does not fit its encoding,
+    /// call-site value that does not fit its encoding or the address size, or
+    /// a region that extends beyond the address space,
     /// [`Error::InvalidActionId`], [`Error::InvalidTypeId`] or
     /// [`Error::InvalidSpecId`] for a dangling id,
     /// [`Error::ExceptionSpecMismatch`], [`Error::NullTypeInfo`],
@@ -331,10 +334,14 @@ impl Lsda {
             return Err(Error::MissingTypeTable);
         }
         let type_size = if has_type_table {
-            usize::from(
-                field_size(self.ttype_encoding, format)?
-                    .ok_or(Error::VariableSizeTypeEncoding(self.ttype_encoding))?,
-            )
+            let size = field_size(self.ttype_encoding, format)?
+                .ok_or(Error::VariableSizeTypeEncoding(self.ttype_encoding))?;
+            // The Arm EHABI personality routines read `R_ARM_TARGET2` words
+            // in place, whatever the encoding says.
+            if arm && (size != ARM_TARGET2_SIZE || self.ttype_encoding.0 == DW_EH_PE_ALIGNED) {
+                return Err(Error::InvalidEncoding(self.ttype_encoding));
+            }
+            usize::from(size)
         } else {
             0
         };
@@ -408,7 +415,7 @@ impl Lsda {
                 }
                 ExceptionSpec::TypeInfos(type_infos) => {
                     let encoding = Encoding::UDATA4;
-                    debug_assert_eq!(encoding.size(4), Some(ARM_SPEC_ENTRY_SIZE));
+                    debug_assert_eq!(encoding.size(4), Some(ARM_TARGET2_SIZE));
                     for address in type_infos {
                         w.write_type_info(encoding, *address, format, bases)?;
                     }
@@ -572,15 +579,21 @@ impl Lsda {
             return Err(Error::UnsupportedCallSiteEncoding(encoding));
         }
         let size = field_size(encoding, format)?;
+        let mask = format.address_mask();
         let mut bytes = EndianVec::new(w.endian());
+        // Values are read back truncated to the address size.
         let value = |bytes: &mut EndianVec<W::Endian>, value: u64| {
-            if read_back(encoding, value, size) != value {
+            if value & !mask != 0 || read_back(encoding, value, size) & mask != value {
                 return Err(Error::ValueOutOfRange(value));
             }
             write_raw(bytes, encoding, value, size)
         };
         for call_site in &self.call_sites {
             if !sjlj {
+                // The region must end within the address space.
+                if call_site.start <= mask && call_site.length > mask - call_site.start {
+                    return Err(Error::ValueOutOfRange(call_site.length));
+                }
                 value(&mut bytes, call_site.start)?;
                 value(&mut bytes, call_site.length)?;
             }
@@ -937,6 +950,42 @@ mod tests {
         assert_eq!(
             lsda.write(&mut w, f, &bases),
             Err(Error::InvalidAlignment(3))
+        );
+        lsda.type_table_alignment = 4;
+
+        // Call-site values must fit the address size, and a region must end
+        // within the address space.
+        lsda.call_site_encoding = Encoding::SDATA4;
+        lsda.call_sites[0].start = (-16i64).cast_unsigned();
+        assert_eq!(
+            lsda.write(&mut w, Format::new(4), &bases),
+            Err(Error::ValueOutOfRange((-16i64).cast_unsigned()))
+        );
+        lsda.call_sites[0].start = 0xffff_fff0;
+        lsda.call_sites[0].length = 0x10;
+        assert_eq!(
+            lsda.write(&mut w, Format::new(4), &bases),
+            Err(Error::ValueOutOfRange(0x10))
+        );
+        lsda.call_sites[0].length = 0x0f;
+        lsda.write(&mut EndianVec::new(LittleEndian), Format::new(4), &bases)
+            .unwrap();
+
+        // Arm EHABI type table entries are 4-byte words read in place.
+        for encoding in [Encoding::UDATA8, Encoding(DW_EH_PE_ALIGNED)] {
+            lsda.ttype_encoding = encoding;
+            assert_eq!(
+                lsda.write(&mut w, Format::arm_ehabi(), &bases),
+                Err(Error::InvalidEncoding(encoding))
+            );
+        }
+        assert_eq!(
+            lsda.write(
+                &mut w,
+                Format::new(8).with_unwinder(Unwinder::ArmEhabi),
+                &bases
+            ),
+            Err(Error::UnsupportedAddressSize(8))
         );
         assert_eq!(w.len(), 0);
     }

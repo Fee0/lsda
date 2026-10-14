@@ -137,14 +137,16 @@ impl Pointer {
         self.value
     }
 
-    /// Return true if the field is zero.
+    /// Return true if the field is zero in its low `address_size` bytes.
     ///
     /// A zero field is a null pointer whatever its application: in the type
-    /// table it means `catch (...)`.
+    /// table it means `catch (...)`. As in libgcc and libc++abi, the value
+    /// is truncated to the address size first, so an 8-byte field with only
+    /// its high half set is null for 4-byte addresses.
     #[inline]
     #[must_use]
     pub fn is_null(&self) -> bool {
-        self.value == 0
+        self.value & size_mask(self.address_size) == 0
     }
 
     /// Return true if the resolved address is the address of a pointer to the
@@ -166,7 +168,7 @@ impl Pointer {
     /// Returns [`Error::MissingBaseAddress`] if the base address that the
     /// application needs is not set.
     pub fn address(&self, bases: &BaseAddresses) -> Result<u64> {
-        if self.value == 0 {
+        if self.is_null() {
             return Ok(0);
         }
         let base = bases
@@ -198,8 +200,22 @@ pub(crate) fn read_pointer<R: Reader>(
             sign_extend(input.read_relocatable(size)?, size)
         }
         Some(size) => input.read_relocatable(size)?,
-        None if encoding.format() == DW_EH_PE_SLEB128 => input.read_sleb128()?.cast_unsigned(),
-        None => input.read_uleb128()?,
+        // A LEB128 value must fit in an address: libgcc's decoding of a
+        // wider value is undefined.
+        None if encoding.format() == DW_EH_PE_SLEB128 => {
+            let value = input.read_sleb128()?.cast_unsigned();
+            if sign_extend(value, address_size) != value {
+                return Err(Error::BadSignedLeb128);
+            }
+            value
+        }
+        None => {
+            let value = input.read_uleb128()?;
+            if value & !size_mask(address_size) != 0 {
+                return Err(Error::BadUnsignedLeb128);
+            }
+            value
+        }
     };
     Ok(Pointer {
         offset,
@@ -273,6 +289,22 @@ mod tests {
             Err(Error::InvalidEncoding(Encoding(5)))
         );
         assert_eq!(read(&data, 6, 0x03, 4), Err(Error::UnexpectedEof));
+        // DW_EH_PE_aligned is only valid on its own.
+        assert_eq!(
+            read(&data, 0, 0x53, 4),
+            Err(Error::InvalidEncoding(Encoding(0x53)))
+        );
+
+        // LEB128 pointers must fit in an address.
+        let wide = [0x80, 0x80, 0x80, 0x80, 0x10];
+        assert_eq!(read(&wide, 0, 0x01, 8).unwrap().value(), 0x1_0000_0000);
+        assert_eq!(read(&wide, 0, 0x01, 4), Err(Error::BadUnsignedLeb128));
+        assert_eq!(read(&wide, 0, 0x09, 4), Err(Error::BadSignedLeb128));
+        let negative = [0x80, 0x80, 0x80, 0x80, 0x78];
+        assert_eq!(
+            read(&negative, 0, 0x09, 4).unwrap().value(),
+            (-0x8000_0000i64).cast_unsigned()
+        );
     }
 
     #[test]
@@ -281,5 +313,15 @@ mod tests {
         let p = read(&data, 0, 0x9b, 4).unwrap();
         assert!(p.is_null() && p.is_indirect());
         assert_eq!(p.address(&BaseAddresses::default()), Ok(0));
+
+        // A value is truncated to the address size before the null check.
+        let data = [0, 0, 0, 0, 1, 0, 0, 0];
+        let bases = BaseAddresses::default().set_section(0x1000);
+        let p = read(&data, 0, 0x14, 4).unwrap();
+        assert!(p.is_null());
+        assert_eq!(p.address(&bases), Ok(0));
+        let p = read(&data, 0, 0x14, 8).unwrap();
+        assert!(!p.is_null());
+        assert_eq!(p.address(&bases), Ok(0x1_0000_1000));
     }
 }

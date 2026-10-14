@@ -251,7 +251,7 @@ pub(crate) fn write_constant_pointer<W: Writer + ?Sized>(
     // Check that reading the field back gives the same address, and is not
     // mistaken for a null pointer.
     let read_back = read_back(encoding, raw, size);
-    if read_back == 0 || read_back.wrapping_add(base) & mask != value {
+    if read_back & mask == 0 || read_back.wrapping_add(base) & mask != value {
         return Err(Error::PointerOutOfRange(value));
     }
     write_raw(w, encoding, raw, size)

@@ -9,9 +9,11 @@ use crate::common::{Base, Encoding};
 pub enum Error {
     /// The input ended before the expected data.
     UnexpectedEof,
-    /// An unsigned LEB128 value was too large.
+    /// An unsigned LEB128 value was too large: wider than 64 bits, or for a
+    /// pointer, than the address size.
     BadUnsignedLeb128,
-    /// A signed LEB128 value was too large.
+    /// A signed LEB128 value was too large: wider than 64 bits, or for a
+    /// pointer, than the address size.
     BadSignedLeb128,
     /// A fixed-size field of this size cannot be read.
     UnsupportedSize(u8),
@@ -42,6 +44,9 @@ pub enum Error {
     /// A referenced exception specification does not start on a list
     /// boundary when the exception specification table is read in sequence.
     MisalignedExceptionSpec(usize),
+    /// The region of the call site at the given section offset extends
+    /// beyond the address space.
+    CallSiteOutOfRange(usize),
 }
 
 impl fmt::Display for Error {
@@ -75,6 +80,10 @@ impl fmt::Display for Error {
             Error::MisalignedExceptionSpec(offset) => write!(
                 f,
                 "exception specification at offset {offset} is not on a list boundary"
+            ),
+            Error::CallSiteOutOfRange(offset) => write!(
+                f,
+                "call site at offset {offset} extends beyond the address space"
             ),
         }
     }
