@@ -34,13 +34,7 @@
 //!     filter: Filter::Catch(int),
 //!     next: None,
 //! });
-//! lsda.call_sites.push(CallSite {
-//!     start: 0x10,
-//!     length: 0x08,
-//!     landing_pad: 0x40,
-//!     action: Some(catch_int),
-//!     ..Default::default()
-//! });
+//! lsda.call_sites.push(CallSite::new(0x10, 0x08, 0x40, Some(catch_int)));
 //!
 //! let mut table = GccExceptTable::new(Format::new(8));
 //! table.add_lsda(lsda);

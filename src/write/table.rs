@@ -208,7 +208,10 @@ impl Default for Lsda {
 }
 
 /// An entry in the call-site table.
+///
+/// Create one with [`CallSite::new`]; more fields may be added.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct CallSite {
     /// The start of the code region, as an offset from the start of the
     /// function. Not written for the SJLJ unwinder.
@@ -228,6 +231,20 @@ pub struct CallSite {
     /// reserved. [`GccExceptTable::from_read`] records the lengths, so that
     /// writing reproduces them.
     pub leb128_lengths: [u8; 3],
+}
+
+impl CallSite {
+    /// Create a call site, with the shortest LEB128 encodings.
+    #[must_use]
+    pub fn new(start: u64, length: u64, landing_pad: u64, action: Option<ActionId>) -> Self {
+        CallSite {
+            start,
+            length,
+            landing_pad,
+            action,
+            leb128_lengths: [0; 3],
+        }
+    }
 }
 
 /// A record in the action table.

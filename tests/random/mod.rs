@@ -171,18 +171,14 @@ pub fn random_lsda(rng: &mut Rng, format: Format) -> Lsda {
     let mut start = 0;
     for i in 0..action_count + rng.below(4) as usize {
         let length = rng.below(0x100) + 1;
-        lsda.call_sites.push(CallSite {
-            start,
-            length,
-            landing_pad: if rng.chance(20) { 0 } else { rng.below(0x400) },
-            action: (i < action_count).then_some(ActionId(i)),
-            // Padded LEB128 values, as RISC-V linkers leave them.
-            leb128_lengths: if rng.chance(20) {
-                [0; 3].map(|_| rng.below(5) as u8)
-            } else {
-                [0; 3]
-            },
-        });
+        let landing_pad = if rng.chance(20) { 0 } else { rng.below(0x400) };
+        let action = (i < action_count).then_some(ActionId(i));
+        let mut call_site = CallSite::new(start, length, landing_pad, action);
+        // Padded LEB128 values, as RISC-V linkers leave them.
+        if rng.chance(20) {
+            call_site.leb128_lengths = [0; 3].map(|_| rng.below(5) as u8);
+        }
+        lsda.call_sites.push(call_site);
         start += length + rng.below(0x10);
     }
     lsda
