@@ -200,10 +200,13 @@ while let Some(entry) = entries.next()? {
 
 To edit LSDAs, convert the tables with `ehabi::write::UnwindTable::from_read`,
 and rewrite the bytes of each `GenericData::Gnu` LSDA with this crate. GCC's
-`@TType` encoding is pc-relative, so write each LSDA with `bases.section` set
-to its address in the output `.ARM.extab`: `UnwindTable::write` returns the
-offsets of the entries. `tests/ehabi.rs` checks both crates together on every
-Arm LSDA of the corpus.
+`@TType` encoding is pc-relative, so read and write each LSDA with
+`bases.section` set to the address of the LSDA itself: the `.ARM.extab`
+address plus its `gnu_lsda_offset`, not the offset of its entry, which is
+8 + 4 × N bytes earlier for N words of unwinding instructions. `from_read`
+keeps every entry in place; if an edit moves entries, write the table and read
+it back to find where each LSDA ends up. `tests/ehabi.rs` checks both crates
+together on every Arm LSDA of the corpus.
 
 ### Dumping an ELF file
 

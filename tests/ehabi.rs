@@ -7,6 +7,7 @@
 //! The tests use the Arm fixture, and every linked Arm file in the directory
 //! named by `LSDA_CORPUS` if it is set (see `tests/corpus.rs`).
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use ehabi::read::UnwindEntry;
@@ -14,7 +15,17 @@ use ehabi::write::{GenericData, IndexEntryData, Sections, UnwindTable};
 use lsda::read::GccExceptTable;
 use lsda::write::{self, Action, Address, CallSite, EntryData, ExceptionSpec, Filter, Lsda};
 use lsda::{BaseAddresses, Encoding, Format, LsdaOffset, RunTimeEndian};
-use object::{Object, ObjectSection};
+use object::{Object, ObjectSection, ObjectSymbol};
+
+/// Personality routines whose generic-model entries use the GCC/LLVM layout,
+/// with an LSDA in the `.gcc_except_table` format.
+const GNU_PERSONALITIES: [&str; 5] = [
+    "__gxx_personality_v0",
+    "__gcc_personality_v0",
+    "__gnu_objc_personality_v0",
+    "__gccgo_personality_v0",
+    "rust_eh_personality",
+];
 
 /// The `.ARM.exidx` and `.ARM.extab` sections of a linked Arm file.
 struct ArmSections {
@@ -24,6 +35,8 @@ struct ArmSections {
     extab: Vec<u8>,
     bases: ehabi::BaseAddresses,
     extab_address: u64,
+    /// Defined symbols by address, to name personality routines.
+    symbols: HashMap<u32, String>,
 }
 
 impl ArmSections {
@@ -40,6 +53,17 @@ impl ArmSections {
         let bases = ehabi::BaseAddresses::default()
             .set_exidx(exidx.address() as u32)
             .set_extab(extab.address() as u32);
+        let symbols = file
+            .symbols()
+            .chain(file.dynamic_symbols())
+            .filter(|symbol| !symbol.is_undefined())
+            .filter_map(|symbol| {
+                // Arm mapping symbols (`$a`, `$d`, ...) are not names.
+                let name = symbol.name().ok().filter(|name| !name.starts_with('$'))?;
+                // Ignore the Thumb bit.
+                Some((symbol.address() as u32 & !1, name.to_string()))
+            })
+            .collect();
         Some(ArmSections {
             name: path.display().to_string(),
             endian: if file.is_little_endian() {
@@ -51,6 +75,7 @@ impl ArmSections {
             extab: extab.data().ok()?.to_vec(),
             bases,
             extab_address: extab.address(),
+            symbols,
         })
     }
 
@@ -61,8 +86,13 @@ impl ArmSections {
         }
     }
 
-    /// The offsets in `.ARM.extab` of the generic entries and of their
-    /// LSDAs, as `ehabi` finds them.
+    /// The offsets in `.ARM.extab` of the generic entries that use the
+    /// GCC/LLVM layout and of their LSDAs, as `ehabi` finds them.
+    ///
+    /// Entries whose personality routine is named and not one of
+    /// [`GNU_PERSONALITIES`] are left out. A routine without a name (one
+    /// called through the PLT of a stripped library) is taken to use the
+    /// GCC/LLVM layout, as every compiler for Arm Linux does.
     fn lsdas(&self) -> Vec<(usize, LsdaOffset)> {
         let endian = self.ehabi_endian();
         let exidx = ehabi::read::ExIdx::new(&self.exidx, endian);
@@ -70,10 +100,17 @@ impl ArmSections {
         let mut lsdas = Vec::new();
         let mut entries = exidx.entries();
         while let Some(entry) = entries.next().unwrap() {
-            if let UnwindEntry::Generic(generic) = entry.resolve(&extab, &self.bases).unwrap() {
-                let lsda = generic.gnu_lsda_offset().unwrap();
-                lsdas.push((generic.offset().0, LsdaOffset(lsda.0)));
+            let UnwindEntry::Generic(generic) = entry.resolve(&extab, &self.bases).unwrap() else {
+                continue;
+            };
+            let personality = generic.personality_address(&self.bases).unwrap() & !1;
+            if let Some(name) = self.symbols.get(&personality)
+                && !GNU_PERSONALITIES.contains(&name.as_str())
+            {
+                continue;
             }
+            let lsda = generic.gnu_lsda_offset().unwrap();
+            lsdas.push((generic.offset().0, LsdaOffset(lsda.0)));
         }
         lsdas.sort_unstable();
         lsdas.dedup();
@@ -154,28 +191,24 @@ fn test_edit_lsdas_through_ehabi() {
         let entry_offsets = table.write(&mut sections, &s.bases).unwrap();
         let lsdas = s.lsdas();
 
-        let ids: Vec<_> = table
+        // The entry of each offset; entries may be shared by functions.
+        let ids: BTreeMap<usize, _> = table
             .index_entries()
             .iter()
             .filter_map(|entry| match entry.data {
-                IndexEntryData::ExTab(id) => Some(id),
+                IndexEntryData::ExTab(id) => Some((entry_offsets.get(id).0, id)),
                 _ => None,
             })
             .collect();
-        let mut converted = 0;
-        for id in ids {
-            let entry_offset = entry_offsets.get(id).0;
+        for (entry_offset, lsda_offset) in &lsdas {
+            let context = format!("{}: entry at {entry_offset:#x}", s.name);
+            let id = ids[entry_offset];
             let ehabi::write::ExTabEntry::Generic(generic) = table.extab_entry_mut(id) else {
-                continue;
+                panic!("{context}: not a generic entry");
             };
             let GenericData::Gnu { lsda: bytes, .. } = &mut generic.data else {
-                continue;
+                panic!("{context}: ehabi did not convert the GCC/LLVM layout");
             };
-            let Some((_, lsda_offset)) = lsdas.iter().find(|(entry, _)| *entry == entry_offset)
-            else {
-                continue;
-            };
-            let context = format!("{}: entry at {entry_offset:#x}", s.name);
             let bases =
                 BaseAddresses::default().set_section(s.extab_address + lsda_offset.0 as u64);
 
@@ -191,7 +224,6 @@ fn test_edit_lsdas_through_ehabi() {
             model.write(&mut w, &bases).expect(&context);
             assert_eq!(w.slice(), bytes.as_slice(), "{context}");
             *bytes = w.into_vec();
-            converted += 1;
         }
 
         let mut sections = Sections::new(ehabi::write::EndianVec::new(endian));
@@ -206,7 +238,7 @@ fn test_edit_lsdas_through_ehabi() {
             "{}: .ARM.extab differs",
             s.name
         );
-        eprintln!("{}: {converted} LSDAs rewritten", s.name);
+        eprintln!("{}: {} LSDAs rewritten", s.name, lsdas.len());
     }
 }
 
@@ -262,6 +294,7 @@ fn test_write_lsda_into_ehabi_entry() {
         extab: sections.extab.slice().to_vec(),
         bases,
         extab_address: 0xa100,
+        symbols: HashMap::new(),
     };
     let [(_, offset)] = s.lsdas()[..] else {
         panic!("expected one LSDA");
