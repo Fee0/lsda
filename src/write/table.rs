@@ -208,7 +208,7 @@ impl Default for Lsda {
 }
 
 /// An entry in the call-site table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CallSite {
     /// The start of the code region, as an offset from the start of the
     /// function. Not written for the SJLJ unwinder.
@@ -220,6 +220,14 @@ pub struct CallSite {
     pub landing_pad: u64,
     /// The first action record, or `None` for cleanups only.
     pub action: Option<ActionId>,
+    /// The minimum length in bytes of the start, the length and the landing
+    /// pad when they are LEB128-encoded, or 0 for the shortest encoding.
+    ///
+    /// Linkers that relax code, as for RISC-V, rewrite these values in
+    /// place, and leave them padded to the length that the assembler
+    /// reserved. [`GccExceptTable::from_read`] records the lengths, so that
+    /// writing reproduces them.
+    pub leb128_lengths: [u8; 3],
 }
 
 /// A record in the action table.
@@ -582,11 +590,11 @@ impl Lsda {
         let mask = format.address_mask();
         let mut bytes = EndianVec::new(w.endian());
         // Values are read back truncated to the address size.
-        let value = |bytes: &mut EndianVec<W::Endian>, value: u64| {
+        let value = |bytes: &mut EndianVec<W::Endian>, value: u64, len: u8| {
             if value & !mask != 0 || read_back(encoding, value, size) & mask != value {
                 return Err(Error::ValueOutOfRange(value));
             }
-            write_raw(bytes, encoding, value, size)
+            write_raw(bytes, encoding, value, size, usize::from(len))
         };
         for call_site in &self.call_sites {
             if !sjlj {
@@ -594,10 +602,14 @@ impl Lsda {
                 if call_site.start <= mask && call_site.length > mask - call_site.start {
                     return Err(Error::ValueOutOfRange(call_site.length));
                 }
-                value(&mut bytes, call_site.start)?;
-                value(&mut bytes, call_site.length)?;
+                value(&mut bytes, call_site.start, call_site.leb128_lengths[0])?;
+                value(&mut bytes, call_site.length, call_site.leb128_lengths[1])?;
             }
-            value(&mut bytes, call_site.landing_pad)?;
+            value(
+                &mut bytes,
+                call_site.landing_pad,
+                call_site.leb128_lengths[2],
+            )?;
             let action = match call_site.action {
                 Some(id) => *action_offsets.get(id.0).ok_or(Error::InvalidActionId)? as u64 + 1,
                 None => 0,
@@ -651,18 +663,21 @@ mod tests {
                 length: 8,
                 landing_pad: 0x20,
                 action: Some(first),
+                ..Default::default()
             },
             CallSite {
                 start: 0x10,
                 length: 4,
                 landing_pad: 0x30,
                 action: None,
+                ..Default::default()
             },
             CallSite {
                 start: 0x14,
                 length: 4,
                 landing_pad: 0,
                 action: Some(spec),
+                ..Default::default()
             },
         ];
         lsda
@@ -716,6 +731,7 @@ mod tests {
                 length: 4,
                 landing_pad: 0x200,
                 action: Some(action),
+                ..Default::default()
             });
         }
         for start in 0..8 {
@@ -752,6 +768,7 @@ mod tests {
             length: 4,
             landing_pad: 8,
             action: Some(actions[0]),
+            ..Default::default()
         });
         let mut w = EndianVec::new(LittleEndian);
         lsda.write(&mut w, Format::new(8), &BaseAddresses::default())
@@ -782,6 +799,7 @@ mod tests {
             length: 4,
             landing_pad: 8,
             action: Some(action),
+            ..Default::default()
         });
         let mut w = EndianVec::new(LittleEndian);
         lsda.write(&mut w, Format::arm_ehabi(), &BaseAddresses::default())
@@ -804,6 +822,7 @@ mod tests {
             length: 0,
             landing_pad: 300,
             action: None,
+            ..Default::default()
         });
         let mut w = EndianVec::new(LittleEndian);
         let format = Format::new(4).with_unwinder(Unwinder::SjLj);
@@ -830,6 +849,7 @@ mod tests {
             length: 4,
             landing_pad: 8,
             action: Some(action),
+            ..Default::default()
         });
         for start in 0..8 {
             let mut w = EndianVec::new(LittleEndian);
@@ -935,6 +955,7 @@ mod tests {
             length: 4,
             landing_pad: 0,
             action: None,
+            ..Default::default()
         });
         assert_eq!(
             lsda.write(&mut w, f, &bases),

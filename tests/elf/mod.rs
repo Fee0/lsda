@@ -75,6 +75,35 @@ impl<'data> LsdaSection<'data> {
         self.lsdas.iter().map(|lsda| lsda.offset).collect()
     }
 
+    /// Return the offset of the first LSDA after `offset`, or the section
+    /// length.
+    pub fn next_offset(&self, offset: LsdaOffset) -> usize {
+        self.lsdas
+            .iter()
+            .map(|lsda| lsda.offset.0)
+            .filter(|&next| next > offset.0)
+            .min()
+            .unwrap_or(self.data.len())
+    }
+}
+
+/// Parse the LSDA at `offset`. If its call-site table extends over the next
+/// LSDA at `next`, it is an LLVM call-site range (`-fbasic-block-sections`):
+/// end its call-site table there, and return true.
+pub fn parse_lsda<R: lsda::read::Reader>(
+    table: &GccExceptTable<R>,
+    offset: LsdaOffset,
+    next: usize,
+) -> lsda::read::Result<(lsda::read::Lsda<R>, bool)> {
+    let lsda = table.lsda_at(offset)?;
+    if lsda.call_site_table_offset() <= next && next < lsda.action_table_offset() {
+        Ok((lsda.with_call_site_table_end(next)?, true))
+    } else {
+        Ok((lsda, false))
+    }
+}
+
+impl LsdaSection<'_> {
     /// Return the LSDA of the named function.
     pub fn lsda_of(&self, name: &str) -> Option<&FunctionLsda> {
         self.lsdas

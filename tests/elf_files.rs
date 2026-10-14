@@ -350,3 +350,81 @@ fn test_arm_exception_specs() {
         assert!(!pointer.is_null());
     }
 }
+
+/// Functions split into several parts, with an LSDA for each: GCC's hot and
+/// cold partitions, and LLVM's call-site ranges for basic block sections.
+#[test]
+fn test_split_functions() {
+    for (name, has_ranges) in [
+        ("gcc14-x86_64-split.so", false),
+        ("clang19-x86_64-bbsections.so", true),
+    ] {
+        let path = format!("{}/tests/data/{name}", env!("CARGO_MANIFEST_DIR"));
+        let data = std::fs::read(&path).unwrap();
+        let file = object::File::parse(&*data).unwrap();
+        let s = elf::load(&file).unwrap();
+        for function in FUNCTIONS {
+            assert!(
+                s.lsda_of(function).is_some(),
+                "{name}: no LSDA for {function}"
+            );
+        }
+        let table = s.table();
+        let bases = s.bases();
+        let mut ranges = Vec::new();
+        let mut explicit_lpstart = 0;
+        // The @LPStart of the call-site ranges of the current function.
+        let mut function_lpstart = None;
+        for function in &s.lsdas {
+            let context = format!("{name} 0x{:x}", function.offset.0);
+            let next = s.next_offset(function.offset);
+            let (lsda, range) = elf::parse_lsda(&table, function.offset, next).expect(&context);
+            if range {
+                ranges.push(function.offset);
+            }
+            if let Some(lpstart) = lsda.lpstart() {
+                // The start of the section with the landing pads, the same
+                // for every range of a function.
+                assert_eq!(lpstart.encoding(), Encoding(0x10), "{context}");
+                let address = lpstart.address(&bases).unwrap();
+                assert_eq!(
+                    *function_lpstart.get_or_insert(address),
+                    address,
+                    "{context}"
+                );
+                explicit_lpstart += 1;
+            }
+            if !range {
+                // The last range of the function.
+                function_lpstart = None;
+            }
+            let tables = lsda.parse_tables().expect(&context);
+            for call_site in tables.call_sites.iter().filter(|c| c.length != 0) {
+                assert_eq!(
+                    lsda.find_call_site(call_site.start).unwrap(),
+                    Some(*call_site),
+                    "{context}"
+                );
+            }
+        }
+        // GCC keeps the landing pads of each part in that part, and LLVM
+        // gives the call-site ranges an explicit @LPStart.
+        assert_eq!(explicit_lpstart != 0, has_ranges, "{name}");
+        assert_eq!(!ranges.is_empty(), has_ranges, "{name}");
+
+        // Every LSDA converts, except the call-site ranges before the last
+        // of each function, and the section is written back identically.
+        let (converted, ids) =
+            write::GccExceptTable::from_read(&s.relocated_table(), &s.offsets(), &bases).unwrap();
+        for (offset, id) in &ids {
+            let raw = matches!(converted.get(*id).data, EntryData::Raw(_));
+            assert_eq!(raw, ranges.contains(offset), "{name} 0x{:x}", offset.0);
+        }
+        let mut w = EndianVec::new(s.endian);
+        converted.write(&mut w, &bases).unwrap();
+        assert!(
+            w.slice() == s.relocated.as_slice(),
+            "{name}: written section differs"
+        );
+    }
+}

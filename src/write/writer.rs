@@ -238,7 +238,7 @@ pub(crate) fn write_constant_pointer<W: Writer + ?Sized>(
         return Err(Error::PointerOutOfRange(value));
     }
     if value == 0 {
-        return write_raw(w, encoding, 0, size);
+        return write_raw(w, encoding, 0, size, 0);
     }
     let base = bases
         .relative_base(encoding, w.len())
@@ -254,20 +254,24 @@ pub(crate) fn write_constant_pointer<W: Writer + ?Sized>(
     if read_back & mask == 0 || read_back.wrapping_add(base) & mask != value {
         return Err(Error::PointerOutOfRange(value));
     }
-    write_raw(w, encoding, raw, size)
+    write_raw(w, encoding, raw, size, 0)
 }
 
-/// Write the raw field value of a pointer.
+/// Write the raw field value of a pointer, in at least `leb128_len` bytes if
+/// it is LEB128-encoded.
 pub(crate) fn write_raw<W: Writer + ?Sized>(
     w: &mut W,
     encoding: Encoding,
     raw: u64,
     size: Option<u8>,
+    leb128_len: usize,
 ) -> Result<()> {
     match size {
         Some(size) => w.write_sized(raw, size),
-        None if encoding.format() == DW_EH_PE_SLEB128 => w.write_sleb128(raw.cast_signed(), 0),
-        None => w.write_uleb128(raw, 0),
+        None if encoding.format() == DW_EH_PE_SLEB128 => {
+            w.write_sleb128(raw.cast_signed(), leb128_len)
+        }
+        None => w.write_uleb128(raw, leb128_len),
     }
 }
 

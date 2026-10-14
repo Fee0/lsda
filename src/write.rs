@@ -39,6 +39,7 @@
 //!     length: 0x08,
 //!     landing_pad: 0x40,
 //!     action: Some(catch_int),
+//!     ..Default::default()
 //! });
 //!
 //! let mut table = GccExceptTable::new(Format::new(8));

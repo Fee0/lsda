@@ -2,8 +2,10 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::common::{BaseAddresses, LsdaOffset, Unwinder, padding};
+use crate::common::{ARM_TARGET2_SIZE, BaseAddresses, Encoding, LsdaOffset, Unwinder, padding};
+use crate::constants::{DW_EH_PE_SLEB128, DW_EH_PE_ULEB128};
 use crate::endianity::Endianity;
+use crate::leb128;
 use crate::read::{self, Reader};
 use crate::write::{
     Action, ActionId, Address, CallSite, Entry, EntryData, Error, ExceptionSpec, Filter,
@@ -49,6 +51,11 @@ pub type ConvertResult<T> = core::result::Result<T, ConvertError>;
 /// alignment of an LSDA or a type table from the padding before it.
 const ALIGNMENTS: [u32; 5] = [4, 8, 16, 2, 1];
 
+/// The most unreferenced action records, and exception specifications, that
+/// a conversion considers. Producers leave a few; the limit bounds the work
+/// on arbitrary data.
+const MAX_UNREFERENCED: usize = 256;
+
 impl GccExceptTable {
     /// Create a table from a parsed section and the offsets of its LSDAs.
     ///
@@ -63,12 +70,19 @@ impl GccExceptTable {
     /// writing the table with the same base addresses reproduces the
     /// section. Each LSDA is converted to [`EntryData::Lsda`] only if writing
     /// it reproduces its bytes exactly; otherwise it is kept as
-    /// [`EntryData::Raw`]. This is the case for non-minimal LEB128 values
-    /// other than the type table base offset, unreferenced data, layouts that
-    /// the producers do not emit (see [`read::Lsda::parse_tables`]), and, when
-    /// reading a relocatable object through a
-    /// [`RelocateReader`](read::RelocateReader), relocated fields whose
-    /// value changes.
+    /// [`EntryData::Raw`].
+    ///
+    /// The conversion keeps what producers emit beyond the referenced tables
+    /// that [`read::Lsda::parse_tables`] decodes: unreferenced action records
+    /// after the referenced ones, with the exception specifications that
+    /// they use (GCC keeps those of call sites that optimization removed),
+    /// unreferenced type table entries (LLVM lists the types of Arm EHABI
+    /// exception specifications), padded `@TType` base offsets, and padded
+    /// LEB128 call-site values (RISC-V linkers leave them). LSDAs are kept
+    /// raw for other non-minimal LEB128 values, other unreferenced data, and,
+    /// when reading a relocatable object through a
+    /// [`RelocateReader`](read::RelocateReader), relocated fields whose value
+    /// changes.
     ///
     /// # Errors
     ///
@@ -112,18 +126,16 @@ impl GccExceptTable {
 
             let lsda = section.lsda_at(offset)?;
             let mut converted = None;
-            if let Some((mut model, end, layouts)) = convert_lsda(&lsda, bases)?
-                && end <= region_end
-            {
-                // Use the first layout of the type table that reproduces the
-                // bytes. Layouts are in decreasing order of entries, so the
-                // model can be truncated in place.
-                for (count, alignment) in layouts {
-                    model.types.truncate(count);
-                    model.type_table_alignment = alignment;
-                    let mut check = Check::new(endian, start, &data[start..end]);
+            if let Some(candidate) = convert_lsda(&lsda, section.reader(), bases, region_end)? {
+                // Use the first layout that reproduces the bytes.
+                for layout in &candidate.layouts {
+                    if layout.end > region_end {
+                        continue;
+                    }
+                    let model = candidate.with_layout(*layout);
+                    let mut check = Check::new(endian, start, &data[start..layout.end]);
                     if model.write(&mut check, format, bases).is_ok() && check.is_complete() {
-                        converted = Some((model, end));
+                        converted = Some((model, layout.end));
                         break;
                     }
                 }
@@ -152,17 +164,68 @@ impl GccExceptTable {
     }
 }
 
-/// A converted LSDA, the section offset of its end, and the possible
-/// layouts of its type table: the number of entries to keep and the
-/// alignment, in order of preference and of decreasing number of entries.
-type Converted = (Lsda, usize, Vec<(usize, u32)>);
+/// A layout of the tables whose extent is not recorded: the number of
+/// action records, type table entries and exception specifications, the
+/// alignment of the type table, and the section offset of the end of the
+/// LSDA.
+#[derive(Debug, Clone, Copy)]
+struct Layout {
+    actions: usize,
+    types: usize,
+    exception_specs: usize,
+    alignment: u32,
+    end: usize,
+}
 
-/// Convert an LSDA, or return `None` if its tables cannot be represented.
+/// A converted LSDA with every candidate action record, type table entry and
+/// exception specification, and the layouts that place the tables where
+/// they are, in order of preference.
+struct Candidate {
+    lsda: Lsda,
+    layouts: Vec<Layout>,
+}
+
+impl Candidate {
+    fn with_layout(&self, layout: Layout) -> Lsda {
+        let mut lsda = self.lsda.clone();
+        lsda.actions.truncate(layout.actions);
+        lsda.types.truncate(layout.types);
+        lsda.exception_specs.truncate(layout.exception_specs);
+        lsda.type_table_alignment = layout.alignment;
+        lsda
+    }
+}
+
+/// Return the highest value of `f` over each prefix of `items`, starting
+/// with `initial` for the empty prefix.
+fn prefix_max<T>(items: &[T], initial: usize, f: impl Fn(&T) -> usize) -> Vec<usize> {
+    let mut max = Vec::with_capacity(items.len() + 1);
+    max.push(initial);
+    for (i, item) in items.iter().enumerate() {
+        max.push(max[i].max(f(item)));
+    }
+    max
+}
+
+/// Convert an LSDA that must end by `region_end`, or return `None` if its
+/// tables cannot be represented.
+///
+/// The extent of the tables is inferred by `parse_tables`, from the
+/// references to them. But GCC keeps the action records and exception
+/// specifications of call sites that optimization removed: unreferenced
+/// records may follow the referenced ones, with the exception
+/// specifications that they use. And the type table may have entries that
+/// nothing refers to, or be preceded by padding that looks like entries.
+/// The candidate holds every record, entry and list that may be part of the
+/// tables, and its layouts are the ways of dividing the bytes between them:
+/// the referenced records first, then more and more of those that follow.
 #[allow(clippy::too_many_lines)]
 fn convert_lsda<R: Reader>(
     lsda: &read::Lsda<R>,
+    section: &R,
     bases: &BaseAddresses,
-) -> ConvertResult<Option<Converted>> {
+    region_end: usize,
+) -> ConvertResult<Option<Candidate>> {
     let tables = match lsda.parse_tables() {
         Ok(tables) => tables,
         Err(e @ read::Error::MissingBaseAddress(_)) => return Err(e.into()),
@@ -171,6 +234,7 @@ fn convert_lsda<R: Reader>(
     let constant = |pointer: read::Pointer| -> ConvertResult<Address> {
         Ok(Address::Constant(pointer.address(bases)?))
     };
+    let arm = lsda.format().unwinder == Unwinder::ArmEhabi;
 
     let lpstart = match lsda.lpstart() {
         Some(pointer) => Some(LpStart {
@@ -180,48 +244,101 @@ fn convert_lsda<R: Reader>(
         None => None,
     };
 
+    // The records that `parse_tables` found, then those that follow them
+    // before the type table base, in sequence. Likewise for the exception
+    // specifications, up to the end of the region. Unreferenced records and
+    // lists are only possible with a type table.
+    let referenced_actions = tables.actions.len();
+    let referenced_specs = tables.exception_specs.len();
+    let mut records = tables.actions.clone();
+    let mut specs = tables.exception_specs.clone();
+    let mut spec_ends = Vec::new();
+    let action_table = lsda.action_table_offset();
+    if let Some(base) = lsda.ttype_base() {
+        let mut offset = tables.action_table_end;
+        while offset < base && records.len() < referenced_actions + MAX_UNREFERENCED {
+            let Ok(action) = lsda.action_at(read::ActionOffset(offset - action_table)) else {
+                break;
+            };
+            offset += action.len();
+            records.push(action);
+        }
+
+        // Exception specification offsets count entries for the Arm EHABI.
+        let unit = if arm { ARM_TARGET2_SIZE as usize } else { 1 };
+        let mut offset = if specs.is_empty() { base } else { tables.end };
+        while offset < region_end && specs.len() < referenced_specs + MAX_UNREFERENCED {
+            let spec = read::SpecOffset((offset - base) / unit);
+            let Ok(mut iter) = lsda.exception_spec(spec) else {
+                break;
+            };
+            let mut entries = Vec::new();
+            let terminated = loop {
+                match iter.next() {
+                    Ok(Some(entry)) => entries.push(entry),
+                    Ok(None) => break true,
+                    Err(_) => break false,
+                }
+            };
+            offset = iter.offset();
+            if !terminated || offset > region_end {
+                break;
+            }
+            specs.push(read::ExceptionSpec {
+                offset: spec,
+                entries,
+            });
+            spec_ends.push(offset);
+        }
+    }
+
     // The tables are in offset order, so an id is found by binary search.
     let action_id = |offset: read::ActionOffset| {
-        tables
-            .actions
+        records
             .binary_search_by_key(&offset, |action| action.offset)
             .ok()
             .map(ActionId)
     };
     let spec_id = |offset: read::SpecOffset| {
-        tables
-            .exception_specs
+        specs
             .binary_search_by_key(&offset, |spec| spec.offset)
             .ok()
             .map(SpecId)
     };
     let type_id = |index: u64| TypeId(index as usize - 1);
 
-    // `parse_tables` found every referenced record and list.
-    let mut actions = Vec::with_capacity(tables.actions.len());
-    let mut referenced_types = 0;
-    for action in &tables.actions {
+    // Convert the records, as far as they can be represented.
+    let mut actions = Vec::with_capacity(records.len());
+    for (i, action) in records.iter().enumerate() {
         let filter = match action.filter {
-            read::Filter::Cleanup => Filter::Cleanup,
-            read::Filter::Catch(index) => {
-                referenced_types = referenced_types.max(index as usize);
-                Filter::Catch(type_id(index))
-            }
-            read::Filter::ExceptionSpec(offset) => match spec_id(offset) {
-                Some(id) => Filter::ExceptionSpec(id),
-                None => return Ok(None),
-            },
+            read::Filter::Cleanup => Some(Filter::Cleanup),
+            read::Filter::Catch(index) => Some(Filter::Catch(type_id(index))),
+            read::Filter::ExceptionSpec(offset) => spec_id(offset).map(Filter::ExceptionSpec),
         };
         let next = match action.next {
-            Some(offset) => match action_id(offset) {
-                Some(id) => Some(id),
-                // The next record is outside the parsed table.
-                None => return Ok(None),
-            },
-            None => None,
+            Some(offset) => action_id(offset).map(Some),
+            None => Some(None),
+        };
+        let (Some(filter), Some(next)) = (filter, next) else {
+            // The referenced records must be representable; the following
+            // ones are candidates only up to here.
+            if i < referenced_actions {
+                return Ok(None);
+            }
+            break;
         };
         actions.push(Action { filter, next });
     }
+    // What the first n records refer to, which the layout must include.
+    let referenced_records = prefix_max(&actions, 0, |action| action.next.map_or(0, |id| id.0 + 1));
+    let action_types = prefix_max(&actions, 0, |action| match action.filter {
+        Filter::Catch(id) => id.0 + 1,
+        _ => 0,
+    });
+    let action_specs = prefix_max(&actions, referenced_specs, |action| match action.filter {
+        Filter::ExceptionSpec(id) => id.0 + 1,
+        _ => 0,
+    });
 
     let mut call_sites = Vec::with_capacity(tables.call_sites.len());
     for call_site in &tables.call_sites {
@@ -232,11 +349,15 @@ fn convert_lsda<R: Reader>(
             },
             None => None,
         };
+        let Ok(leb128_lengths) = leb128_lengths(lsda, section, call_site) else {
+            return Ok(None);
+        };
         call_sites.push(CallSite {
             start: call_site.start,
             length: call_site.length,
             landing_pad: call_site.landing_pad,
             action,
+            leb128_lengths,
         });
     }
 
@@ -249,9 +370,8 @@ fn convert_lsda<R: Reader>(
         });
     }
 
-    let arm = lsda.format().unwinder == Unwinder::ArmEhabi;
-    let mut exception_specs = Vec::with_capacity(tables.exception_specs.len());
-    for spec in &tables.exception_specs {
+    let mut exception_specs = Vec::with_capacity(specs.len());
+    for spec in &specs {
         let entries = spec.entries.iter();
         exception_specs.push(if arm {
             ExceptionSpec::TypeInfos(
@@ -268,73 +388,160 @@ fn convert_lsda<R: Reader>(
             ExceptionSpec::Types(
                 entries
                     .filter_map(|entry| match *entry {
-                        read::SpecEntry::Type(index) => {
-                            referenced_types = referenced_types.max(index as usize);
-                            Some(type_id(index))
-                        }
+                        read::SpecEntry::Type(index) => Some(type_id(index)),
                         read::SpecEntry::TypeInfo(_) => None,
                     })
                     .collect(),
             )
         });
     }
+    let spec_types = prefix_max(&exception_specs, 0, |spec| match spec {
+        ExceptionSpec::Types(types) => types.iter().map(|id| id.0 + 1).max().unwrap_or(0),
+        ExceptionSpec::TypeInfos(_) => 0,
+    });
 
-    // The type table may have unreferenced entries, and the padding before
-    // it depends on its alignment. The entries beyond the highest referenced
-    // index may be padding instead, if they are zero; list the layouts that
-    // place the table where it is.
     let mut layouts = Vec::new();
-    if let Some(base) = lsda.ttype_base() {
-        let Ok(size) = lsda.ttype_entry_size() else {
+    let Some(base) = lsda.ttype_base() else {
+        layouts.push(Layout {
+            actions: referenced_actions,
+            types: 0,
+            exception_specs: 0,
+            alignment: 4,
+            end: tables.end,
+        });
+        return Ok(Some(Candidate {
+            lsda: Lsda {
+                lpstart,
+                ttype_encoding: lsda.ttype_encoding(),
+                call_site_encoding: lsda.call_site_encoding(),
+                type_table_alignment: 4,
+                call_sites,
+                actions,
+                types,
+                exception_specs,
+            },
+            layouts,
+        }));
+    };
+    let Ok(size) = lsda.ttype_entry_size() else {
+        return Ok(None);
+    };
+    // Every entry between the referenced records and the base.
+    let available = base.saturating_sub(tables.action_table_end) / size;
+    for index in types.len() + 1..=available {
+        let Ok(pointer) = lsda.type_entry(index as u64) else {
             return Ok(None);
         };
-        let action_end = tables.action_table_end;
-        // The table may hold entries that nothing refers to, between the
-        // action table and the referenced entries.
-        let available = base.saturating_sub(action_end) / size;
-        for index in types.len() + 1..=available {
-            let Ok(pointer) = lsda.type_entry(index as u64) else {
-                return Ok(None);
-            };
-            types.push(if pointer.is_null() {
-                None
-            } else {
-                Some(constant(pointer)?)
-            });
-        }
-        for count in (referenced_types..=types.len()).rev() {
-            if types[count..].iter().any(Option::is_some) {
-                break;
-            }
-            let Some(types_start) = base.checked_sub(count * size) else {
-                continue;
-            };
-            // Prefer the entry size, as GCC aligns to it.
-            let entry_alignment = size as u32;
-            for alignment in [entry_alignment]
-                .into_iter()
-                .chain(ALIGNMENTS.into_iter().filter(|&a| a != entry_alignment))
-            {
-                if action_end + padding(action_end, alignment as usize) == types_start {
-                    layouts.push((count, alignment));
-                }
-            }
-        }
-    } else {
-        layouts.push((0, 4));
+        types.push(if pointer.is_null() {
+            None
+        } else {
+            Some(constant(pointer)?)
+        });
     }
 
-    let converted = Lsda {
-        lpstart,
-        ttype_encoding: lsda.ttype_encoding(),
-        call_site_encoding: lsda.call_site_encoding(),
-        type_table_alignment: 4,
-        call_sites,
-        actions,
-        types,
-        exception_specs,
+    // The number of entries up to the last non-null one, for each number of
+    // entries.
+    let mut non_null = Vec::with_capacity(types.len() + 1);
+    non_null.push(0);
+    for (i, entry) in types.iter().enumerate() {
+        non_null.push(if entry.is_some() { i + 1 } else { non_null[i] });
+    }
+    // Prefer the entry size, as GCC aligns to it.
+    let entry_alignment = size as u32;
+    let alignments = [entry_alignment]
+        .into_iter()
+        .chain(ALIGNMENTS.into_iter().filter(|&a| a != entry_alignment));
+    for count in referenced_actions..=actions.len() {
+        let spec_count = action_specs[count];
+        if referenced_records[count] > count || spec_count > exception_specs.len() {
+            // A record refers to one beyond the tables.
+            continue;
+        }
+        let end = match spec_count.checked_sub(referenced_specs + 1) {
+            Some(extra) => spec_ends[extra],
+            None => tables.end,
+        };
+        let action_end = match count.checked_sub(1) {
+            Some(last) => action_table + records[last].offset.0 + records[last].len(),
+            None => action_table,
+        };
+        let referenced = action_types[count].max(spec_types[spec_count]);
+        // The entries that do not overlap the records.
+        let entries = if count == referenced_actions {
+            types.len()
+        } else {
+            types.len().min(base.saturating_sub(action_end) / size)
+        };
+        // The alignment places the type table after the padding. The entries
+        // beyond the highest referenced index may be padding instead, if they
+        // are zero.
+        let fewest = referenced.max(non_null[entries]);
+        for alignment in alignments.clone() {
+            let types_start = action_end + padding(action_end, alignment as usize);
+            let Some(table_size) = base.checked_sub(types_start) else {
+                continue;
+            };
+            let type_count = table_size / size;
+            if table_size % size == 0 && (fewest..=entries).contains(&type_count) {
+                layouts.push(Layout {
+                    actions: count,
+                    types: type_count,
+                    exception_specs: spec_count,
+                    alignment,
+                    end,
+                });
+            }
+        }
+    }
+
+    Ok(Some(Candidate {
+        lsda: Lsda {
+            lpstart,
+            ttype_encoding: lsda.ttype_encoding(),
+            call_site_encoding: lsda.call_site_encoding(),
+            type_table_alignment: 4,
+            call_sites,
+            actions,
+            types,
+            exception_specs,
+        },
+        layouts,
+    }))
+}
+
+/// Return the lengths of the LEB128-encoded values of a call site that are
+/// longer than the shortest encoding, as [`CallSite::leb128_lengths`].
+fn leb128_lengths<R: Reader>(
+    lsda: &read::Lsda<R>,
+    section: &R,
+    call_site: &read::CallSite,
+) -> read::Result<[u8; 3]> {
+    let sjlj = lsda.format().unwinder == Unwinder::SjLj;
+    let encoding = if sjlj {
+        Encoding::ULEB128
+    } else {
+        lsda.call_site_encoding()
     };
-    Ok(Some((converted, tables.end, layouts)))
+    let signed = encoding.format() == DW_EH_PE_SLEB128;
+    if encoding.format() != DW_EH_PE_ULEB128 && !signed {
+        return Ok([0; 3]);
+    }
+    let mut input = section.range_from(call_site.offset)?;
+    let mut lengths = [0; 3];
+    let fields = if sjlj { 2..3 } else { 0..3 };
+    for field in fields {
+        let before = input.len();
+        let shortest = if signed {
+            leb128::signed_len(input.read_sleb128()?)
+        } else {
+            leb128::unsigned_len(input.read_uleb128()?)
+        };
+        let len = before - input.len();
+        if len > shortest {
+            lengths[field] = u8::try_from(len).map_err(|_| read::Error::BadUnsignedLeb128)?;
+        }
+    }
+    Ok(lengths)
 }
 
 /// A writer that checks that what is written at a section offset matches the
@@ -407,6 +614,50 @@ mod tests {
     }
 
     #[test]
+    fn test_unreferenced_records() {
+        // From libstdc++ for x86-64: a function whose call sites were all
+        // removed keeps the action record of its `throw()` specification,
+        // and the specification, which follows the type table base.
+        let data = [
+            0xff, 0x9b, 0x05, 0x01, 0x00, // header, base at 0x08
+            0x7f, 0x00, // action: exception specification 0
+            0x00, // padding
+            0x00, // exception specification: throw()
+            0x00, 0x00, 0x00, // padding before the next LSDA
+            0xff, 0xff, 0x01, 0x00, // the next LSDA
+        ];
+        let table = roundtrip(&data, &[0, 12], Format::new(8));
+        let EntryData::Lsda(lsda) = &table.entries()[0].data else {
+            panic!("expected an LSDA");
+        };
+        assert_eq!(lsda.call_sites, []);
+        assert_eq!(
+            lsda.actions,
+            [Action {
+                filter: Filter::ExceptionSpec(SpecId(0)),
+                next: None
+            }]
+        );
+        assert_eq!(lsda.exception_specs, [ExceptionSpec::Types(Vec::new())]);
+    }
+
+    #[test]
+    fn test_padded_leb128() {
+        // From libc for RISC-V: the linker rewrote a call-site length of 0x70
+        // in the two bytes that the assembler reserved.
+        let data = [
+            0xff, 0xff, 0x01, 0x05, // header
+            0x10, 0xf0, 0x00, 0x00, 0x00, // call site
+        ];
+        let table = roundtrip(&data, &[0], Format::new(8));
+        let EntryData::Lsda(lsda) = &table.entries()[0].data else {
+            panic!("expected an LSDA");
+        };
+        assert_eq!(lsda.call_sites[0].length, 0x70);
+        assert_eq!(lsda.call_sites[0].leb128_lengths, [0, 2, 0]);
+    }
+
+    #[test]
     fn test_roundtrip() {
         let mut data = Vec::new();
         // A GCC-style LSDA without a type table.
@@ -424,6 +675,7 @@ mod tests {
             length: 4,
             landing_pad: 8,
             action: Some(action),
+            ..Default::default()
         });
         let mut w = EndianVec::new(LittleEndian);
         w.write(&data).unwrap();
@@ -483,6 +735,7 @@ mod tests {
             length: 4,
             landing_pad: 8,
             action: Some(action),
+            ..Default::default()
         });
         let mut w = EndianVec::new(LittleEndian);
         lsda.write(&mut w, Format::new(4), &BaseAddresses::default())

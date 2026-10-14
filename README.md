@@ -64,6 +64,7 @@ exception specs    uleb128 type indices, 0-terminated (Arm EHABI: TARGET2 words)
 | Type table | Every fixed-size `DW_EH_PE_*` encoding, with `pcrel`, `textrel`, `datarel`, `funcrel`, `aligned` and `indirect`; null entries (`catch (...)`) |
 | Exception specifications | ULEB128 type index lists; Arm EHABI `R_ARM_TARGET2` word lists |
 | Extent | The extent of the action, type and exception specification tables, which is not recorded, inferred as GCC and LLVM emit them |
+| Split functions | GCC's hot/cold partitions (an LSDA per part), and LLVM's call-site ranges for `-fbasic-block-sections` (`Lsda::with_call_site_table_end`) |
 
 ## Installation
 
@@ -155,6 +156,7 @@ lsda.call_sites.push(CallSite {
     length: 0x08,
     landing_pad: 0x40,
     action: Some(catch_int),
+    ..Default::default()
 });
 
 let mut table = GccExceptTable::new(Format::new(8));
@@ -197,23 +199,37 @@ relocations of an object file allow) and exception specifications.
 - **Inferred extent.** The lengths of the action, type and exception
   specification tables are not recorded. `parse_tables` reads the action
   records reachable from the call sites, the exception specifications they
-  reference, and the type table up to the highest referenced index. For the
-  Arm EHABI, where LLVM also lists types that are not referenced by index,
-  the type table fills the space between the action table and its base. Data
-  that nothing refers to, which GCC and LLVM never emit otherwise, is not
-  decoded (`from_read` still keeps it, so round trips stay lossless).
+  reference, and the type table up to the highest referenced index. Data that
+  nothing refers to is not decoded: GCC keeps the action records and
+  exception specifications of call sites that optimization removed, and LLVM
+  lists the types of Arm EHABI exception specifications. `from_read` keeps
+  them, so round trips stay lossless.
 - **Round-trip conditions.** `from_read` converts an LSDA only if writing it
-  reproduces its bytes exactly, and keeps it as raw bytes otherwise: for
-  example with a non-minimal LEB128 value outside the `@TType` base offset,
-  or an action table with unreferenced trailing records. Gaps between LSDAs
-  that are not zero alignment padding are kept as raw bytes too.
+  reproduces its bytes exactly, and keeps it as raw bytes otherwise. It
+  handles what producers emit: unreferenced records, entries and
+  specifications, padded `@TType` base offsets, and padded LEB128 call-site
+  values (RISC-V linkers leave them). It keeps raw other non-minimal LEB128
+  values, other unreferenced data, and LLVM call-site ranges before the last
+  of a function, since the model has a single call-site table. Gaps between
+  LSDAs that are not zero alignment padding are kept as raw bytes too.
+- **Call-site ranges need their end.** The call-site table length of an LLVM
+  call-site range extends over the ranges after it. The caller, which knows
+  where the next range starts from its FDE, ends the table there with
+  `Lsda::with_call_site_table_end`.
 - **Relocated values.** Through a `RelocateReader`, `from_read` compares
   against the stored (unrelocated) bytes, so LSDAs with relocated fields are
   kept raw. Apply the relocations to a copy of the section first to convert
   them.
 - **Call-site values are offsets.** Call-site encodings must have the
-  `DW_EH_PE_absptr` application, as every producer emits; libgcc rejects
-  the others too.
+  `DW_EH_PE_absptr` application, as every producer emits. Values are
+  truncated to the address size, as the personality routine reads them, and
+  a region must end within the address space.
+- **Strict pointer encodings.** `DW_EH_PE_aligned` is only valid on its own
+  (libgcc reads other combinations unaligned, libc++abi not at all), and a
+  LEB128 pointer must fit in an address. For the Arm EHABI the address size
+  is 4, and the `@TType` encoding must have size 4 and not be aligned: the
+  personality routines read `R_ARM_TARGET2` words in place, whatever the
+  encoding says.
 - **`R_ARM_TARGET2` values are raw.** Their interpretation is
   platform-specific (absolute, GOT-relative or place-relative).
 
@@ -228,7 +244,8 @@ clang 10 from `tests/data/src/eh.cpp` (rebuild with `tests/data/build.sh`):
 cleanups, single and multiple handlers, nested `try` blocks, dynamic
 exception specifications, `throw()`, `noexcept`, rethrow, and a function with
 enough handlers for multi-byte LEB128 values. The targets are x86-64, i386,
-AArch64, big-endian PowerPC64 and Arm EHABI. They verify:
+AArch64, big-endian PowerPC64 and Arm EHABI. GCC 14 and clang 19 builds add
+split functions: hot/cold partitions and basic block sections. They verify:
 
 - every LSDA parses identically through the relocation layer and from the
   relocated section, and LSDAs do not overlap;
@@ -246,6 +263,45 @@ section exactly. Random LSDAs in every encoding must read back as written and
 convert back to the same bytes. It runs 20,000 iterations per test by
 default; set `LSDA_FUZZ_ITERATIONS` for longer runs (preferably in debug
 mode, where integer overflow panics).
+
+### Differential test against libstdc++
+
+`tests/oracle.rs` checks that the crate decodes LSDAs as the GNU C++
+personality routine does. `tests/personality/oracle.c` runs libgcc's own
+pointer decoding (`unwind-pe.h`, downloaded from GCC 14.2 and changed only to
+not follow indirect pointers) and the LSDA logic of libstdc++'s
+`eh_personality.cc`: it finds the call site for each location, then walks its
+actions, type table entries and exception specifications. The test compares
+its output with the crate's for the fixtures, random LSDAs in every encoding,
+and mutations of both that the crate accepts. It needs a C compiler for 64-
+and 32-bit targets (on Debian and Ubuntu, `gcc-multilib`):
+
+```sh
+sh tests/personality/build.sh target/oracle
+LSDA_ORACLE64=target/oracle/oracle64 LSDA_ORACLE32=target/oracle/oracle32 \
+    cargo test --release --test oracle -- --nocapture
+```
+
+Set `LSDA_ORACLE_ITERATIONS` for more random LSDAs. The test is skipped
+without the oracles; CI runs it.
+
+### Real-world corpus
+
+`tests/corpus.rs` checks every ELF file in the directory named by
+`LSDA_CORPUS`: every LSDA must parse completely and find its call sites,
+every section must convert and write back byte for byte, and, with the
+oracles set, every little-endian LSDA must decode as libstdc++ decodes it.
+`scripts/fetch_corpus.py` downloads a corpus of Debian packages, mostly C++
+libraries built by GCC 14 and libc++ built by clang 19, for x86-64, i386,
+AArch64, Arm EHABI, PowerPC64, big-endian s390x and RISC-V:
+
+```sh
+python scripts/fetch_corpus.py ../lsda-corpus
+LSDA_CORPUS=../lsda-corpus cargo test --release --test corpus -- --nocapture
+```
+
+With Debian 13, this checks 249,507 LSDAs in 144 files, all converted and
+written back identically, of which 222,230 also match libstdc++.
 
 ## License
 

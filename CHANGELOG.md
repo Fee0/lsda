@@ -26,10 +26,17 @@ Initial release.
 - Writing through `GccExceptTable` and `Lsda`, with computed offsets,
   alignment padding and `@TType` base offset, and `Absolute`, `Relative` and
   `Target2` relocations recorded by `RelocateWriter`.
-- Lossless conversion of parsed sections with `GccExceptTable::from_read`.
+- Lossless conversion of parsed sections with `GccExceptTable::from_read`,
+  including the unreferenced action records, type table entries and exception
+  specifications that producers leave, and padded LEB128 call-site values
+  (RISC-V).
+- LLVM call-site ranges (`-fbasic-block-sections`), with
+  `Lsda::with_call_site_table_end`.
 - `no_std` support (requires `alloc`) and an optional `fallible-iterator`
   feature.
 - The `lsdadump` example, which dumps the LSDAs of an ELF file.
+- A differential test against libgcc's and libstdc++'s decoding, and a test
+  against a corpus of Debian binaries for eight architectures.
 
 [Unreleased]: https://github.com/Fee0/lsda/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/Fee0/lsda/releases/tag/v0.1.0

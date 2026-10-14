@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds the LSDA oracle (oracle.c) for 64- and 32-bit addresses.
 #
-#   tests/oracle/build.sh [output directory]
+#   tests/personality/build.sh [output directory]
 #
 # Requires curl and a C compiler that can target both widths (on Debian and
 # Ubuntu, gcc-multilib), or set ORACLE_WIDTHS to the widths to build. Static

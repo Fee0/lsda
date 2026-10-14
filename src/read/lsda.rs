@@ -89,6 +89,9 @@ pub struct Lsda<R: Reader> {
     ttype_base: Option<usize>,
     call_site_encoding: Encoding,
     call_sites: R,
+    /// Whether the call-site table was cut short by
+    /// [`Lsda::with_call_site_table_end`], and may end with padding.
+    call_sites_cut: bool,
     actions: R,
     section: R,
 }
@@ -149,9 +152,43 @@ impl<R: Reader> Lsda<R> {
             ttype_base,
             call_site_encoding,
             call_sites,
+            call_sites_cut: false,
             actions: input,
             section: section.clone(),
         })
+    }
+
+    /// Return the LSDA with its call-site table ending at the section offset
+    /// `end`, if that is before the action table.
+    ///
+    /// With `-fbasic-block-sections`, LLVM splits the call-site table of a
+    /// function into ranges, one for each section of the function. Each range
+    /// has its own LSDA header, which the FDE of that section refers to,
+    /// followed by the call sites in that section, and the ranges share the
+    /// action and type tables that follow the last one. So that they find
+    /// the action table, the call-site table length of each range extends to
+    /// the end of the last range, over the ranges that follow it. The
+    /// personality routine still finds the call sites of a range, since it
+    /// stops at the first call site past the location.
+    ///
+    /// To read the call sites of a range alone, end its call-site table where
+    /// the next range starts. Up to 3 zero bytes at the end are taken as the
+    /// padding that aligns the next range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OffsetOutOfBounds`] if `end` is before the call-site
+    /// table.
+    pub fn with_call_site_table_end(mut self, end: usize) -> Result<Self> {
+        let start = self.call_site_table_offset();
+        if end < start {
+            return Err(Error::OffsetOutOfBounds);
+        }
+        if end < self.action_table_offset() {
+            self.call_sites = self.section.range_from(start)?.split(end - start)?;
+            self.call_sites_cut = true;
+        }
+        Ok(self)
     }
 
     /// Return the offset of the LSDA within its section.
@@ -252,6 +289,7 @@ impl<R: Reader> Lsda<R> {
             encoding: self.call_site_encoding,
             format: self.format,
             index: 0,
+            padded: self.call_sites_cut,
         }
     }
 
@@ -385,13 +423,16 @@ impl<R: Reader> Lsda<R> {
     ///   read in sequence from its start (unreferenced records between them
     ///   are included);
     /// * the type table holds as many entries as the highest index referenced
-    ///   by an action or exception specification. For the Arm EHABI, where
-    ///   LLVM also lists the types of exception specifications, which are not
-    ///   referenced by index, it holds at least the whole entries between the
-    ///   end of the action table and the type table base (padding is smaller
-    ///   than an entry);
+    ///   by an action or exception specification;
     /// * the exception specification table holds the lists referenced by
     ///   the actions, read in sequence from the type table base.
+    ///
+    /// Data that nothing refers to is not decoded: GCC keeps the action
+    /// records and exception specifications of call sites that optimization
+    /// removed, after the referenced ones, and LLVM also lists the types of
+    /// Arm EHABI exception specifications in the type table.
+    /// [`write::GccExceptTable::from_read`](crate::write::GccExceptTable::from_read)
+    /// keeps them.
     ///
     /// # Errors
     ///
@@ -457,17 +498,6 @@ impl<R: Reader> Lsda<R> {
             if let Some(missing) = spec_offsets.difference(&starts).next() {
                 return Err(Error::MisalignedExceptionSpec(missing.0));
             }
-        }
-
-        // Producers emit only referenced types, except that LLVM also lists
-        // the types of Arm EHABI exception specifications, which refer to
-        // `type_info` objects directly. For the Arm EHABI, take the table to
-        // fill the space after the action table, less padding.
-        if self.format.unwinder == Unwinder::ArmEhabi
-            && let Ok((base, size)) = self.type_table()
-            && let Some(space) = base.checked_sub(action_table_end)
-        {
-            type_count = type_count.max((space / size) as u64);
         }
 
         let mut types = Vec::new();
@@ -563,6 +593,8 @@ pub struct CallSiteIter<R: Reader> {
     encoding: Encoding,
     format: Format,
     index: u64,
+    /// Whether the table may end with alignment padding.
+    padded: bool,
 }
 
 impl<R: Reader> CallSiteIter<R> {
@@ -577,7 +609,7 @@ impl<R: Reader> CallSiteIter<R> {
     /// the action does not fit in a `usize`. After an error, the iterator
     /// returns `Ok(None)`.
     pub fn next(&mut self) -> Result<Option<CallSite>> {
-        if self.input.is_empty() {
+        if self.input.is_empty() || self.at_padding() {
             return Ok(None);
         }
         match self.parse() {
@@ -590,6 +622,17 @@ impl<R: Reader> CallSiteIter<R> {
                 Err(e)
             }
         }
+    }
+
+    /// Return true if the rest of a cut call-site table is padding: zero
+    /// bytes, fewer than the smallest entry.
+    fn at_padding(&self) -> bool {
+        self.padded
+            && self.input.len() < 4
+            && self
+                .input
+                .to_slice()
+                .is_ok_and(|bytes| bytes.iter().all(|&b| b == 0))
     }
 
     fn parse(&mut self) -> Result<CallSite> {
@@ -1010,7 +1053,7 @@ mod tests {
             0x00, 0x04, 0x08, 0x01, // call site
             0x7f, 0x00, // action: spec at entry 0
             0x00, // padding
-            0x00, 0x00, 0x00, 0x00, // an unreferenced null type
+            0x00, 0x00, 0x00, 0x00, // an unreferenced type entry
             0x00, 0x00, 0x01, 0x00, // spec: two words, terminator
             0x00, 0x00, 0x02, 0x00, //
             0x00, 0x00, 0x00, 0x00,
@@ -1019,9 +1062,8 @@ mod tests {
         let lsda = table.lsda_at(LsdaOffset(0)).unwrap();
         assert_eq!(lsda.ttype_base(), Some(0x10));
         let tables = lsda.parse_tables().unwrap();
-        // The zero word before the base is taken as an unreferenced entry.
-        assert_eq!(tables.types.len(), 1);
-        assert!(tables.types[0].is_null());
+        // The word before the base is not referenced.
+        assert_eq!(tables.types.len(), 0);
         let entries: Vec<_> = tables.exception_specs[0]
             .entries
             .iter()
@@ -1036,8 +1078,7 @@ mod tests {
 
     #[test]
     fn test_unreferenced_bytes_before_types() {
-        // Unreferenced bytes after the last action record are not types,
-        // except for the Arm EHABI, where LLVM lists unreferenced types.
+        // Unreferenced bytes after the last action record are not types.
         let data = [
             0xff, 0x03, 0x14, 0x01, 0x04, // header, base at 0x17
             0x00, 0x04, 0x00, 0x01, // call site
@@ -1045,22 +1086,52 @@ mod tests {
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // unreferenced
             0x00, 0x10, 0x00, 0x00, // type 1
         ];
-        let table = GccExceptTable::new(&data, LittleEndian, Format::new(4));
-        let tables = table
-            .lsda_at(LsdaOffset(0))
-            .unwrap()
-            .parse_tables()
-            .unwrap();
-        assert_eq!(tables.types.len(), 1);
-        assert_eq!(tables.types[0].value(), 0x1000);
+        for format in [Format::new(4), Format::arm_ehabi()] {
+            let table = GccExceptTable::new(&data, LittleEndian, format);
+            let tables = table
+                .lsda_at(LsdaOffset(0))
+                .unwrap()
+                .parse_tables()
+                .unwrap();
+            assert_eq!(tables.types.len(), 1);
+            assert_eq!(tables.types[0].value(), 0x1000);
+            assert_eq!(tables.end, data.len());
+        }
+    }
 
-        let table = GccExceptTable::new(&data, LittleEndian, Format::arm_ehabi());
-        let tables = table
-            .lsda_at(LsdaOffset(0))
-            .unwrap()
-            .parse_tables()
-            .unwrap();
-        assert_eq!(tables.types.len(), 3);
+    #[test]
+    fn test_call_site_ranges() {
+        // Two LLVM call-site ranges that share the action table.
+        let data = [
+            0xff, 0xff, 0x01, 0x10, // range 1: call sites up to 0x14
+            0x00, 0x84, 0x01, 0x00, 0x00, // call site
+            0x00, 0x00, 0x00, // padding
+            0xff, 0xff, 0x01, 0x04, // range 2 at 0x0c
+            0x00, 0x08, 0x02, 0x01, // call site
+            0x00, 0x00, // action table at 0x14
+        ];
+        let table = GccExceptTable::new(&data, LittleEndian, Format::new(8));
+        let first = table.lsda_at(LsdaOffset(0)).unwrap();
+        // Read as one table, the call sites run into the second range.
+        assert!(first.parse_tables().is_err());
+        let first = first.with_call_site_table_end(0x0c).unwrap();
+        let tables = first.parse_tables().unwrap();
+        assert_eq!(tables.call_sites.len(), 1);
+        assert_eq!(tables.call_sites[0].length, 0x84);
+        assert_eq!(first.action_table_offset(), 0x14);
+        assert_eq!(first.find_call_site(0x90).unwrap(), None);
+
+        let second = table.lsda_at(LsdaOffset(0x0c)).unwrap();
+        let tables = second.parse_tables().unwrap();
+        assert_eq!(tables.call_sites[0].action, Some(ActionOffset(0)));
+        assert_eq!(tables.end, data.len());
+        // An end at or after the action table changes nothing.
+        let same = second.clone().with_call_site_table_end(0x20).unwrap();
+        assert_eq!(same.parse_tables().unwrap(), tables);
+        assert_eq!(
+            second.with_call_site_table_end(0x0f).err(),
+            Some(Error::OffsetOutOfBounds)
+        );
     }
 
     #[test]

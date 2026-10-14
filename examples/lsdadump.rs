@@ -58,7 +58,11 @@ fn dump(s: &elf::LsdaSection<'_>) -> lsda::read::Result<()> {
             function.offset.0,
             s.describe(function.function)
         );
-        let lsda = table.lsda_at(function.offset)?;
+        let (lsda, range) =
+            elf::parse_lsda(&table, function.offset, s.next_offset(function.offset))?;
+        if range {
+            println!("  a call-site range: the call-site table ends at the next LSDA");
+        }
         dump_lsda(s, &lsda, &bases)?;
     }
     Ok(())

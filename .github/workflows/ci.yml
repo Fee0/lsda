@@ -45,7 +45,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: sudo apt-get update && sudo apt-get install -y gcc-multilib
-      - run: sh tests/oracle/build.sh target/oracle
+      - run: sh tests/personality/build.sh target/oracle
       - run: cargo test --release --test oracle -- --nocapture
         env:
           LSDA_ORACLE64: target/oracle/oracle64

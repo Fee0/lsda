@@ -63,6 +63,7 @@ pub fn random_address(rng: &mut Rng) -> Address {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn random_lsda(rng: &mut Rng, format: Format) -> Lsda {
     let mut lsda = Lsda::new();
     if rng.chance(20) {
@@ -135,6 +136,38 @@ pub fn random_lsda(rng: &mut Rng, format: Format) -> Lsda {
             .then(|| ActionId(i + 1 + rng.below((action_count - i - 1) as u64) as usize));
         lsda.add_action(Action { filter, next });
     }
+    // Records that no call site reaches, as GCC keeps for call sites that
+    // optimization removed, with exception specifications only they use.
+    if rng.chance(20) {
+        for _ in 0..=rng.below(3) {
+            let filter = match rng.below(3) {
+                1 if type_count > 0 => Filter::Catch(TypeId(rng.below(type_count as u64) as usize)),
+                2 => {
+                    let len = rng.below(3) as usize;
+                    let spec = if arm {
+                        ExceptionSpec::TypeInfos(
+                            (0..len)
+                                .map(|_| Address::Constant(rng.below(0x1_0000) + 1))
+                                .collect(),
+                        )
+                    } else {
+                        ExceptionSpec::Types(
+                            (0..len.min(type_count))
+                                .map(|_| TypeId(rng.below(type_count as u64) as usize))
+                                .collect(),
+                        )
+                    };
+                    Filter::ExceptionSpec(lsda.add_exception_spec(spec))
+                }
+                _ => Filter::Cleanup,
+            };
+            let count = lsda.actions.len();
+            let next =
+                (count > 0 && rng.chance(50)).then(|| ActionId(rng.below(count as u64) as usize));
+            lsda.add_action(Action { filter, next });
+        }
+    }
+
     let mut start = 0;
     for i in 0..action_count + rng.below(4) as usize {
         let length = rng.below(0x100) + 1;
@@ -143,6 +176,12 @@ pub fn random_lsda(rng: &mut Rng, format: Format) -> Lsda {
             length,
             landing_pad: if rng.chance(20) { 0 } else { rng.below(0x400) },
             action: (i < action_count).then_some(ActionId(i)),
+            // Padded LEB128 values, as RISC-V linkers leave them.
+            leb128_lengths: if rng.chance(20) {
+                [0; 3].map(|_| rng.below(5) as u8)
+            } else {
+                [0; 3]
+            },
         });
         start += length + rng.below(0x10);
     }
