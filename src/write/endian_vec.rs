@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 use core::mem;
 
 use crate::endianity::Endianity;
-use crate::write::{Error, Result, Writer};
+use crate::write::{Result, Writer};
 
 /// A `Vec<u8>` with endianity metadata.
 ///
@@ -66,17 +66,6 @@ where
         self.vec.extend_from_slice(bytes);
         Ok(())
     }
-
-    fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
-        let end = offset
-            .checked_add(bytes.len())
-            .ok_or(Error::OffsetOutOfBounds)?;
-        if end > self.vec.len() {
-            return Err(Error::OffsetOutOfBounds);
-        }
-        self.vec[offset..end].copy_from_slice(bytes);
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -90,9 +79,6 @@ mod tests {
         w.write_u32(0x0102_0304).unwrap();
         w.write_u16(0x0506).unwrap();
         assert_eq!(w.slice(), [4, 3, 2, 1, 6, 5]);
-        w.write_at(0, &[0xd, 0xc, 0xb, 0xa]).unwrap();
-        assert_eq!(w.slice(), [0xd, 0xc, 0xb, 0xa, 6, 5]);
-        assert_eq!(w.write_at(4, &[0; 4]), Err(Error::OffsetOutOfBounds));
 
         let mut w = EndianVec::new(BigEndian);
         w.write_u32(0x0102_0304).unwrap();

@@ -1,14 +1,10 @@
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
-use crate::common::{Encoding, Format, LsdaOffset, Unwinder};
+use crate::common::{ARM_SPEC_ENTRY_SIZE, Encoding, Format, LsdaOffset, Unwinder};
 use crate::constants::DW_EH_PE_ABSPTR;
 use crate::endianity::Endianity;
 use crate::read::{EndianSlice, Error, Pointer, Reader, Result, read_pointer, target2_pointer};
-
-/// The size of an Arm EHABI exception specification entry: a `_uleb128_t`,
-/// which is a 32-bit word in libgcc's Arm unwinder.
-const ARM_SPEC_ENTRY_SIZE: usize = 4;
 
 /// A section that holds LSDAs: `.gcc_except_table`, or `.ARM.extab` for the
 /// Arm EHABI.
@@ -87,7 +83,6 @@ impl<R: Reader> GccExceptTable<R> {
 pub struct Lsda<R: Reader> {
     offset: LsdaOffset,
     format: Format,
-    lpstart_encoding: Encoding,
     lpstart: Option<Pointer>,
     ttype_encoding: Encoding,
     ttype_base: Option<usize>,
@@ -99,7 +94,7 @@ pub struct Lsda<R: Reader> {
 
 impl<R: Reader> Lsda<R> {
     fn parse(section: &R, offset: LsdaOffset, format: Format) -> Result<Self> {
-        if !matches!(format.address_size, 2 | 4 | 8) {
+        if !format.has_valid_address_size() {
             return Err(Error::UnsupportedAddressSize(format.address_size));
         }
         if offset.0 >= section.len() {
@@ -151,7 +146,6 @@ impl<R: Reader> Lsda<R> {
         Ok(Lsda {
             offset,
             format,
-            lpstart_encoding,
             lpstart,
             ttype_encoding,
             ttype_base,
@@ -177,7 +171,8 @@ impl<R: Reader> Lsda<R> {
     /// Return the encoding of the landing pad base (`@LPStart`).
     #[inline]
     pub fn lpstart_encoding(&self) -> Encoding {
-        self.lpstart_encoding
+        self.lpstart
+            .map_or(Encoding::OMIT, |lpstart| lpstart.encoding())
     }
 
     /// Return the landing pad base, or `None` if it is omitted, in which case
@@ -228,13 +223,17 @@ impl<R: Reader> Lsda<R> {
     /// Returns [`Error::MissingTypeTable`] if there is no type table, and
     /// [`Error::VariableSizeTypeEncoding`] if the encoding has no fixed size.
     pub fn ttype_entry_size(&self) -> Result<usize> {
-        if self.ttype_base.is_none() {
-            return Err(Error::MissingTypeTable);
-        }
-        self.ttype_encoding
+        self.type_table().map(|(_, size)| size)
+    }
+
+    /// Return the type table base and entry size.
+    fn type_table(&self) -> Result<(usize, usize)> {
+        let base = self.ttype_base.ok_or(Error::MissingTypeTable)?;
+        let size = self
+            .ttype_encoding
             .size(self.format.address_size)
-            .map(usize::from)
-            .ok_or(Error::VariableSizeTypeEncoding(self.ttype_encoding))
+            .ok_or(Error::VariableSizeTypeEncoding(self.ttype_encoding))?;
+        Ok((base, usize::from(size)))
     }
 
     /// Return an iterator over the call-site table.
@@ -288,42 +287,19 @@ impl<R: Reader> Lsda<R> {
     /// [`Error::OffsetOutOfBounds`] if the record's next displacement points
     /// before the action table.
     pub fn action_at(&self, offset: ActionOffset) -> Result<Action> {
-        let mut input = self.actions.range_from(offset.0)?;
-        let filter = Filter::from_value(input.read_sleb128()?)?;
-        let place = input.offset_from(&self.actions);
-        let displacement = input.read_sleb128()?;
-        let next = if displacement == 0 {
-            None
-        } else {
-            let next = i64::try_from(place)
-                .ok()
-                .and_then(|place| place.checked_add(displacement))
-                .and_then(|next| usize::try_from(next).ok())
-                .ok_or(Error::OffsetOutOfBounds)?;
-            Some(ActionOffset(next))
-        };
-        Ok(Action {
-            offset,
-            filter,
-            next,
-            len: input.offset_from(&self.actions) - offset.0,
-        })
+        parse_action(&self.actions, offset)
     }
 
     /// Return an iterator over the chain of action records starting at
     /// `first`.
-    ///
-    /// # Errors
-    ///
-    /// This does not fail; errors are returned by [`ActionIter::next`].
-    pub fn actions(&self, first: ActionOffset) -> Result<ActionIter<R>> {
-        Ok(ActionIter {
-            lsda: self.clone(),
+    pub fn actions(&self, first: ActionOffset) -> ActionIter<R> {
+        ActionIter {
+            actions: self.actions.clone(),
             next: Some(first),
             // A chain that does not terminate must revisit a record, and each
             // record is at least 2 bytes.
             remaining: self.actions.len() / 2 + 1,
-        })
+        }
     }
 
     /// Return the type table entry with the given 1-based index, as used by
@@ -344,8 +320,7 @@ impl<R: Reader> Lsda<R> {
         if index == 0 {
             return Err(Error::InvalidTypeIndex);
         }
-        let size = self.ttype_entry_size()?;
-        let base = self.ttype_base.ok_or(Error::MissingTypeTable)?;
+        let (base, size) = self.type_table()?;
         let offset = usize::try_from(index)
             .ok()
             .and_then(|index| index.checked_mul(size))
@@ -375,7 +350,7 @@ impl<R: Reader> Lsda<R> {
         let base = self.ttype_base.ok_or(Error::MissingTypeTable)?;
         let arm = self.format.unwinder == Unwinder::ArmEhabi;
         let delta = if arm {
-            offset.0.checked_mul(ARM_SPEC_ENTRY_SIZE)
+            offset.0.checked_mul(usize::from(ARM_SPEC_ENTRY_SIZE))
         } else {
             Some(offset.0)
         };
@@ -431,7 +406,7 @@ impl<R: Reader> Lsda<R> {
             }
             // A record seen earlier in this chain is a cycle; one seen in
             // another chain is a shared tail, which is already visited.
-            let mut chain = self.actions(first)?;
+            let mut chain = self.actions(first);
             let mut visited = BTreeSet::new();
             while let Some(action) = chain.next()? {
                 if !visited.insert(action.offset) {
@@ -476,7 +451,7 @@ impl<R: Reader> Lsda<R> {
         // referenced list.
         let mut exception_specs = Vec::new();
         let mut spec_end = self.ttype_base;
-        if let Some(last) = spec_offsets.last() {
+        if let (Some(last), Some(base)) = (spec_offsets.last(), self.ttype_base) {
             let mut starts = BTreeSet::new();
             let mut offset = SpecOffset(0);
             while offset <= *last {
@@ -490,11 +465,11 @@ impl<R: Reader> Lsda<R> {
                 }
                 starts.insert(offset);
                 exception_specs.push(ExceptionSpec { offset, entries });
-                let end = iter.input.offset_from(&self.section);
+                let end = iter.offset();
                 spec_end = Some(end);
-                let len = end - self.ttype_base.unwrap_or(end);
+                let len = end - base;
                 offset = SpecOffset(if iter.arm {
-                    len / ARM_SPEC_ENTRY_SIZE
+                    len / usize::from(ARM_SPEC_ENTRY_SIZE)
                 } else {
                     len
                 });
@@ -507,7 +482,7 @@ impl<R: Reader> Lsda<R> {
         // Producers emit only referenced types, except that LLVM also lists
         // the types of Arm EHABI exception specifications. Take the table to
         // fill the space after the action table, less padding.
-        if let (Some(base), Ok(size)) = (self.ttype_base, self.ttype_entry_size())
+        if let Ok((base, size)) = self.type_table()
             && let Some(space) = base.checked_sub(action_table_end)
         {
             type_count = type_count.max((space / size) as u64);
@@ -741,7 +716,7 @@ impl Action {
 /// [`Lsda::actions`].
 #[derive(Debug, Clone)]
 pub struct ActionIter<R: Reader> {
-    lsda: Lsda<R>,
+    actions: R,
     next: Option<ActionOffset>,
     remaining: usize,
 }
@@ -762,10 +737,34 @@ impl<R: Reader> ActionIter<R> {
             return Err(Error::ActionCycle);
         }
         self.remaining -= 1;
-        let action = self.lsda.action_at(offset)?;
+        let action = parse_action(&self.actions, offset)?;
         self.next = action.next;
         Ok(Some(action))
     }
+}
+
+/// Parse the action record at `offset` in the action table `actions`.
+fn parse_action<R: Reader>(actions: &R, offset: ActionOffset) -> Result<Action> {
+    let mut input = actions.range_from(offset.0)?;
+    let filter = Filter::from_value(input.read_sleb128()?)?;
+    let place = input.offset_from(actions);
+    let displacement = input.read_sleb128()?;
+    let next = if displacement == 0 {
+        None
+    } else {
+        let next = i64::try_from(place)
+            .ok()
+            .and_then(|place| place.checked_add(displacement))
+            .and_then(|next| usize::try_from(next).ok())
+            .ok_or(Error::OffsetOutOfBounds)?;
+        Some(ActionOffset(next))
+    };
+    Ok(Action {
+        offset,
+        filter,
+        next,
+        len: input.offset_from(actions) - offset.0,
+    })
 }
 
 impl_iterators!(ActionIter, Action);
@@ -827,7 +826,7 @@ impl<R: Reader> ExceptionSpecIter<R> {
     fn parse(&mut self) -> Result<Option<SpecEntry>> {
         let offset = self.offset();
         if self.arm {
-            match self.input.read_relocatable(ARM_SPEC_ENTRY_SIZE as u8)? {
+            match self.input.read_relocatable(ARM_SPEC_ENTRY_SIZE)? {
                 0 => Ok(None),
                 value => Ok(Some(SpecEntry::TypeInfo(target2_pointer(offset, value)))),
             }
@@ -921,13 +920,11 @@ mod tests {
 
         let chain: Vec<_> = lsda
             .actions(ActionOffset(0))
-            .unwrap()
             .map(|a| a.unwrap().filter)
             .collect();
         assert_eq!(chain, [Filter::Catch(1), Filter::Catch(2)]);
         let chain: Vec<_> = lsda
             .actions(ActionOffset(6))
-            .unwrap()
             .map(|a| a.unwrap().filter)
             .collect();
         assert_eq!(

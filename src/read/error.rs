@@ -1,7 +1,7 @@
 use core::fmt;
 use core::result;
 
-use crate::common::{Base, Encoding, Unwinder};
+use crate::common::{Base, Encoding};
 
 /// An error that occurred when parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,8 +21,6 @@ pub enum Error {
     OffsetOutOfBounds,
     /// A pointer encoding has an undefined format or application.
     InvalidEncoding(Encoding),
-    /// A pointer that must be present has the encoding `DW_EH_PE_omit`.
-    OmittedPointer,
     /// The type table entries must have a fixed size, but the encoding is
     /// LEB128.
     VariableSizeTypeEncoding(Encoding),
@@ -31,8 +29,6 @@ pub enum Error {
     UnsupportedCallSiteEncoding(Encoding),
     /// A base address that a pointer encoding needs was not provided.
     MissingBaseAddress(Base),
-    /// The operation is not available for this unwinder variant.
-    UnsupportedUnwinder(Unwinder),
     /// The type table is used but the LSDA has no type table
     /// (`DW_EH_PE_omit` type table encoding).
     MissingTypeTable,
@@ -60,7 +56,6 @@ impl fmt::Display for Error {
             Error::InvalidEncoding(encoding) => {
                 write!(f, "invalid pointer encoding 0x{:02x}", encoding.0)
             }
-            Error::OmittedPointer => f.write_str("required pointer has encoding DW_EH_PE_omit"),
             Error::VariableSizeTypeEncoding(encoding) => {
                 write!(f, "type table encoding {encoding} has no fixed size")
             }
@@ -68,9 +63,6 @@ impl fmt::Display for Error {
                 write!(f, "unsupported call-site encoding {encoding}")
             }
             Error::MissingBaseAddress(base) => write!(f, "the {base} base address is required"),
-            Error::UnsupportedUnwinder(unwinder) => {
-                write!(f, "operation not supported for the {unwinder:?} unwinder")
-            }
             Error::MissingTypeTable => f.write_str("the LSDA has no type table"),
             Error::InvalidTypeIndex => f.write_str("type index 0 is invalid"),
             Error::ActionCycle => f.write_str("action record chain does not terminate"),

@@ -1,7 +1,7 @@
 //! Tests against the ELF fixtures built from `tests/data/src/eh.cpp` by GCC
 //! and clang (see `tests/data/build.sh`).
 
-use lsda::read::{self, Filter, Reader, SpecEntry};
+use lsda::read::{self, Filter, SpecEntry};
 use lsda::write::{self, EndianVec, EntryData};
 use lsda::{Encoding, Unwinder};
 
@@ -151,7 +151,6 @@ fn summarize(s: &elf::LsdaSection<'_>, function: &str) -> Summary {
         .filter_map(|call_site| call_site.action)
         .map(|first| {
             lsda.actions(first)
-                .unwrap()
                 .map(|action| action.unwrap().filter)
                 .collect()
         })
@@ -350,5 +349,4 @@ fn test_arm_exception_specs() {
         assert_eq!(pointer.offset() % 4, 0);
         assert!(!pointer.is_null());
     }
-    let _ = s.table().reader().len();
 }

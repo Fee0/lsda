@@ -103,7 +103,7 @@ let lsda = table.lsda_at(LsdaOffset(lsda_offset))?;
 if let Some(call_site) = lsda.find_call_site(pc - function_start)? {
     println!("landing pad +{:#x}", call_site.landing_pad);
     if let Some(first) = call_site.action {
-        let mut actions = lsda.actions(first)?;
+        let mut actions = lsda.actions(first);
         while let Some(action) = actions.next()? {
             match action.filter {
                 Filter::Cleanup => println!("cleanup"),

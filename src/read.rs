@@ -31,7 +31,7 @@
 //! assert_eq!(call_site.landing_pad, 0x40);
 //!
 //! let bases = BaseAddresses::default().set_section(0x1000);
-//! let mut actions = lsda.actions(call_site.action.expect("has an action"))?;
+//! let mut actions = lsda.actions(call_site.action.expect("has an action"));
 //! while let Some(action) = actions.next()? {
 //!     if let Filter::Catch(index) = action.filter {
 //!         let type_info = lsda.type_entry(index)?;
@@ -61,7 +61,8 @@
 //! * For relocatable objects, wrap the section data in a [`RelocateReader`]
 //!   so that relocated fields are seen as they would be after linking.
 
-use crate::common::{Base, BaseAddresses, Encoding, Format, application_base};
+use crate::common::{BaseAddresses, Encoding, padding, sign_extend, size_mask};
+use crate::constants::{DW_EH_PE_ALIGNED, DW_EH_PE_SLEB128};
 
 /// Implement `Iterator` (and `FallibleIterator`) for a type with an inherent
 /// `fn next(&mut self) -> Result<Option<Item>>` that stops after an error.
@@ -168,16 +169,10 @@ impl Pointer {
         if self.value == 0 {
             return Ok(0);
         }
-        let format = Format::new(self.address_size);
-        let mut address = self.value;
-        if let Some(base) = application_base(self.encoding.application()) {
-            let mut base_address = bases.get(base).ok_or(Error::MissingBaseAddress(base))?;
-            if base == Base::Section {
-                base_address = base_address.wrapping_add(self.offset as u64);
-            }
-            address = address.wrapping_add(base_address);
-        }
-        Ok(address & format.address_mask())
+        let base = bases
+            .relative_base(self.encoding, self.offset)
+            .map_err(Error::MissingBaseAddress)?;
+        Ok(self.value.wrapping_add(base) & size_mask(self.address_size))
     }
 }
 
@@ -188,37 +183,23 @@ pub(crate) fn read_pointer<R: Reader>(
     encoding: Encoding,
     address_size: u8,
 ) -> Result<Pointer> {
-    use crate::constants::*;
-
-    if encoding.0 == DW_EH_PE_OMIT {
-        return Err(Error::OmittedPointer);
-    }
+    // This also rejects DW_EH_PE_omit.
     if !encoding.is_valid() {
         return Err(Error::InvalidEncoding(encoding));
     }
-    if encoding.application() == DW_EH_PE_ALIGNED {
+    let aligned = encoding.application() == DW_EH_PE_ALIGNED;
+    if aligned {
         let offset = input.offset_from(section);
-        input.skip(offset.wrapping_neg() % usize::from(address_size))?;
+        input.skip(padding(offset, usize::from(address_size)))?;
     }
     let offset = input.offset_from(section);
-    let sign_extend = |value: u64, size: u8| {
-        let shift = 64 - u32::from(size) * 8;
-        ((value << shift).cast_signed() >> shift).cast_unsigned()
-    };
-    let value = if encoding.application() == DW_EH_PE_ALIGNED {
-        input.read_relocatable(address_size)?
-    } else {
-        match encoding.format() {
-            DW_EH_PE_ABSPTR => input.read_relocatable(address_size)?,
-            DW_EH_PE_ULEB128 => input.read_uleb128()?,
-            DW_EH_PE_SLEB128 => input.read_sleb128()?.cast_unsigned(),
-            DW_EH_PE_UDATA2 => input.read_relocatable(2)?,
-            DW_EH_PE_UDATA4 => input.read_relocatable(4)?,
-            DW_EH_PE_SDATA2 => sign_extend(input.read_relocatable(2)?, 2),
-            DW_EH_PE_SDATA4 => sign_extend(input.read_relocatable(4)?, 4),
-            // DW_EH_PE_udata8 and DW_EH_PE_sdata8.
-            _ => input.read_relocatable(8)?,
+    let value = match encoding.size(address_size) {
+        Some(size) if encoding.is_signed() && !aligned => {
+            sign_extend(input.read_relocatable(size)?, size)
         }
+        Some(size) => input.read_relocatable(size)?,
+        None if encoding.format() == DW_EH_PE_SLEB128 => input.read_sleb128()?.cast_unsigned(),
+        None => input.read_uleb128()?,
     };
     Ok(Pointer {
         offset,
@@ -242,6 +223,7 @@ pub(crate) fn target2_pointer(offset: usize, value: u64) -> Pointer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Base;
     use crate::endianity::LittleEndian;
 
     fn read(data: &[u8], skip: usize, encoding: u8, address_size: u8) -> Result<Pointer> {
@@ -282,7 +264,10 @@ mod tests {
             p.address(&BaseAddresses::default()),
             Err(Error::MissingBaseAddress(Base::Text))
         );
-        assert_eq!(read(&data, 0, 0xff, 4), Err(Error::OmittedPointer));
+        assert_eq!(
+            read(&data, 0, 0xff, 4),
+            Err(Error::InvalidEncoding(Encoding::OMIT))
+        );
         assert_eq!(
             read(&data, 0, 0x05, 4),
             Err(Error::InvalidEncoding(Encoding(5)))

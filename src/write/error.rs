@@ -38,8 +38,6 @@ pub enum Error {
     InvalidActionId,
     /// A `SpecId` does not refer to an exception specification.
     InvalidSpecId,
-    /// An `LsdaId` does not belong to this table.
-    InvalidLsdaId,
     /// An exception specification does not match the unwinder: the Arm
     /// EHABI requires [`ExceptionSpec::TypeInfos`](crate::write::ExceptionSpec::TypeInfos),
     /// the others [`ExceptionSpec::Types`](crate::write::ExceptionSpec::Types).
@@ -88,7 +86,6 @@ impl fmt::Display for Error {
             Error::InvalidTypeId => f.write_str("invalid type id"),
             Error::InvalidActionId => f.write_str("invalid action id"),
             Error::InvalidSpecId => f.write_str("invalid exception specification id"),
-            Error::InvalidLsdaId => f.write_str("invalid LSDA id"),
             Error::ExceptionSpecMismatch => {
                 f.write_str("exception specification does not match the unwinder")
             }

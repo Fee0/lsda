@@ -2,12 +2,11 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::common::{BaseAddresses, LsdaOffset, Unwinder};
+use crate::common::{BaseAddresses, LsdaOffset, Unwinder, padding};
 use crate::endianity::Endianity;
 use crate::read::{self, Reader};
-use crate::write::writer::padding;
 use crate::write::{
-    Action, ActionId, Address, CallSite, EndianVec, Entry, EntryData, Error, ExceptionSpec, Filter,
+    Action, ActionId, Address, CallSite, Entry, EntryData, Error, ExceptionSpec, Filter,
     GccExceptTable, LpStart, Lsda, LsdaId, Result, SpecId, TypeId, Writer,
 };
 
@@ -91,6 +90,7 @@ impl GccExceptTable {
 
         let mut table = GccExceptTable::new(format);
         let mut ids = BTreeMap::new();
+        let endian = section.reader().endian();
         let mut cursor = 0;
         for (i, &offset) in offsets.iter().enumerate() {
             let region_end = offsets.get(i + 1).map_or(data.len(), |next| next.0);
@@ -98,38 +98,32 @@ impl GccExceptTable {
 
             // Explain the gap before the LSDA as alignment padding, or keep it.
             let gap = &data[cursor..start];
-            let alignment = if gap.iter().all(|&b| b == 0) {
-                ALIGNMENTS
-                    .into_iter()
-                    .find(|&a| cursor + padding(cursor, a).unwrap_or(0) == start)
-            } else {
-                None
-            };
-            let alignment = alignment.unwrap_or_else(|| {
+            let padded = gap.iter().all(|&b| b == 0);
+            let alignment = ALIGNMENTS
+                .into_iter()
+                .find(|&a| padded && cursor + padding(cursor, a as usize) == start);
+            if alignment.is_none() {
                 table.add(Entry {
                     alignment: 1,
                     data: EntryData::Raw(gap.to_vec()),
                 });
-                1
-            });
+            }
+            let alignment = alignment.unwrap_or(1);
 
             let lsda = section.lsda_at(offset)?;
             let mut converted = None;
-            if let Some((model, end, layouts)) = convert_lsda(&lsda, bases)?
+            if let Some((mut model, end, layouts)) = convert_lsda(&lsda, bases)?
                 && end <= region_end
             {
-                // Use the first layout of the type table that reproduces
-                // the bytes.
-                let endian = section.reader().endian();
+                // Use the first layout of the type table that reproduces the
+                // bytes. Layouts are in decreasing order of entries, so the
+                // model can be truncated in place.
                 for (count, alignment) in layouts {
-                    let mut candidate = model.clone();
-                    candidate.types.truncate(count);
-                    candidate.type_table_alignment = alignment;
-                    let mut scratch = Scratch::new(start, data.len(), endian);
-                    if candidate.write(&mut scratch, format, bases).is_ok()
-                        && scratch.bytes() == &data[start..end]
-                    {
-                        converted = Some((candidate, end));
+                    model.types.truncate(count);
+                    model.type_table_alignment = alignment;
+                    let mut check = Check::new(endian, start, &data[start..end]);
+                    if model.write(&mut check, format, bases).is_ok() && check.is_complete() {
+                        converted = Some((model, end));
                         break;
                     }
                 }
@@ -160,7 +154,7 @@ impl GccExceptTable {
 
 /// A converted LSDA, the section offset of its end, and the possible
 /// layouts of its type table: the number of entries to keep and the
-/// alignment, in order of preference.
+/// alignment, in order of preference and of decreasing number of entries.
 type Converted = (Lsda, usize, Vec<(usize, u32)>);
 
 /// Convert an LSDA, or return `None` if its tables cannot be represented.
@@ -186,30 +180,40 @@ fn convert_lsda<R: Reader>(
         None => None,
     };
 
-    let action_ids: BTreeMap<read::ActionOffset, ActionId> = tables
-        .actions
-        .iter()
-        .enumerate()
-        .map(|(i, action)| (action.offset, ActionId(i)))
-        .collect();
-    let spec_ids: BTreeMap<read::SpecOffset, SpecId> = tables
-        .exception_specs
-        .iter()
-        .enumerate()
-        .map(|(i, spec)| (spec.offset, SpecId(i)))
-        .collect();
+    // The tables are in offset order, so an id is found by binary search.
+    let action_id = |offset: read::ActionOffset| {
+        tables
+            .actions
+            .binary_search_by_key(&offset, |action| action.offset)
+            .ok()
+            .map(ActionId)
+    };
+    let spec_id = |offset: read::SpecOffset| {
+        tables
+            .exception_specs
+            .binary_search_by_key(&offset, |spec| spec.offset)
+            .ok()
+            .map(SpecId)
+    };
     let type_id = |index: u64| TypeId(index as usize - 1);
 
+    // `parse_tables` found every referenced record and list.
     let mut actions = Vec::with_capacity(tables.actions.len());
+    let mut referenced_types = 0;
     for action in &tables.actions {
         let filter = match action.filter {
             read::Filter::Cleanup => Filter::Cleanup,
-            read::Filter::Catch(index) => Filter::Catch(type_id(index)),
-            read::Filter::ExceptionSpec(offset) => Filter::ExceptionSpec(spec_ids[&offset]),
+            read::Filter::Catch(index) => {
+                referenced_types = referenced_types.max(index as usize);
+                Filter::Catch(type_id(index))
+            }
+            read::Filter::ExceptionSpec(offset) => {
+                Filter::ExceptionSpec(spec_id(offset).ok_or(Error::InvalidSpecId)?)
+            }
         };
         let next = match action.next {
-            Some(offset) => match action_ids.get(&offset) {
-                Some(id) => Some(*id),
+            Some(offset) => match action_id(offset) {
+                Some(id) => Some(id),
                 // The next record is outside the parsed table.
                 None => return Ok(None),
             },
@@ -218,16 +222,19 @@ fn convert_lsda<R: Reader>(
         actions.push(Action { filter, next });
     }
 
-    let call_sites = tables
-        .call_sites
-        .iter()
-        .map(|call_site| CallSite {
+    let mut call_sites = Vec::with_capacity(tables.call_sites.len());
+    for call_site in &tables.call_sites {
+        let action = match call_site.action {
+            Some(offset) => Some(action_id(offset).ok_or(Error::InvalidActionId)?),
+            None => None,
+        };
+        call_sites.push(CallSite {
             start: call_site.start,
             length: call_site.length,
             landing_pad: call_site.landing_pad,
-            action: call_site.action.map(|offset| action_ids[&offset]),
-        })
-        .collect();
+            action,
+        });
+    }
 
     let mut types = Vec::with_capacity(tables.types.len());
     for pointer in &tables.types {
@@ -238,22 +245,33 @@ fn convert_lsda<R: Reader>(
         });
     }
 
+    let arm = lsda.format().unwinder == Unwinder::ArmEhabi;
     let mut exception_specs = Vec::with_capacity(tables.exception_specs.len());
     for spec in &tables.exception_specs {
-        let mut type_ids = Vec::new();
-        let mut type_infos = Vec::new();
-        for entry in &spec.entries {
-            match *entry {
-                read::SpecEntry::Type(index) => type_ids.push(type_id(index)),
-                read::SpecEntry::TypeInfo(pointer) => {
-                    type_infos.push(Address::Constant(pointer.value()));
-                }
-            }
-        }
-        exception_specs.push(if lsda.format().unwinder == Unwinder::ArmEhabi {
-            ExceptionSpec::TypeInfos(type_infos)
+        let entries = spec.entries.iter();
+        exception_specs.push(if arm {
+            ExceptionSpec::TypeInfos(
+                entries
+                    .filter_map(|entry| match entry {
+                        read::SpecEntry::TypeInfo(pointer) => {
+                            Some(Address::Constant(pointer.value()))
+                        }
+                        read::SpecEntry::Type(_) => None,
+                    })
+                    .collect(),
+            )
         } else {
-            ExceptionSpec::Types(type_ids)
+            ExceptionSpec::Types(
+                entries
+                    .filter_map(|entry| match *entry {
+                        read::SpecEntry::Type(index) => {
+                            referenced_types = referenced_types.max(index as usize);
+                            Some(type_id(index))
+                        }
+                        read::SpecEntry::TypeInfo(_) => None,
+                    })
+                    .collect(),
+            )
         });
     }
 
@@ -266,33 +284,21 @@ fn convert_lsda<R: Reader>(
         let Ok(size) = lsda.ttype_entry_size() else {
             return Ok(None);
         };
-        let referenced = actions
-            .iter()
-            .filter_map(|action| match action.filter {
-                Filter::Catch(id) => Some(id.0 + 1),
-                _ => None,
-            })
-            .chain(exception_specs.iter().flat_map(|spec| match spec {
-                ExceptionSpec::Types(ids) => ids.iter().map(|id| id.0 + 1).collect(),
-                ExceptionSpec::TypeInfos(_) => Vec::new(),
-            }))
-            .max()
-            .unwrap_or(0);
         let action_end = tables.action_table_end;
-        for count in (referenced..=types.len()).rev() {
+        for count in (referenced_types..=types.len()).rev() {
             if types[count..].iter().any(Option::is_some) {
                 break;
             }
             let Some(types_start) = base.checked_sub(count * size) else {
                 continue;
             };
-            let mut alignments: Vec<u32> = [size as u32].into_iter().chain(ALIGNMENTS).collect();
-            alignments.dedup();
-            for alignment in alignments {
-                if alignment.is_power_of_two()
-                    && action_end + padding(action_end, alignment).unwrap_or(0) == types_start
-                    && !layouts.contains(&(count, alignment))
-                {
+            // Prefer the entry size, as GCC aligns to it.
+            let entry_alignment = size as u32;
+            for alignment in [entry_alignment]
+                .into_iter()
+                .chain(ALIGNMENTS.into_iter().filter(|&a| a != entry_alignment))
+            {
+                if action_end + padding(action_end, alignment as usize) == types_start {
                     layouts.push((count, alignment));
                 }
             }
@@ -314,53 +320,50 @@ fn convert_lsda<R: Reader>(
     Ok(Some((converted, tables.end, layouts)))
 }
 
-/// A writer that starts at a given section offset, for checking that an
-/// entry re-encodes to its original bytes.
+/// A writer that checks that what is written at a section offset matches the
+/// expected bytes, stopping at the first difference.
 #[derive(Debug)]
-struct Scratch<E: Endianity> {
+struct Check<'a, E: Endianity> {
+    endian: E,
     start: usize,
-    limit: usize,
-    vec: EndianVec<E>,
+    expected: &'a [u8],
+    written: usize,
 }
 
-impl<E: Endianity> Scratch<E> {
-    fn new(start: usize, limit: usize, endian: E) -> Self {
-        Scratch {
+impl<'a, E: Endianity> Check<'a, E> {
+    fn new(endian: E, start: usize, expected: &'a [u8]) -> Self {
+        Check {
+            endian,
             start,
-            limit,
-            vec: EndianVec::new(endian),
+            expected,
+            written: 0,
         }
     }
 
-    fn bytes(&self) -> &[u8] {
-        self.vec.slice()
+    /// Return true if every expected byte was written.
+    fn is_complete(&self) -> bool {
+        self.written == self.expected.len()
     }
 }
 
-impl<E: Endianity> Writer for Scratch<E> {
+impl<E: Endianity> Writer for Check<'_, E> {
     type Endian = E;
 
     fn endian(&self) -> Self::Endian {
-        self.vec.endian()
+        self.endian
     }
 
     fn len(&self) -> usize {
-        self.start + self.vec.len()
+        self.start + self.written
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        // Stop early when an entry grows beyond the section.
-        if self.len() + bytes.len() > self.limit {
+        let end = self.written + bytes.len();
+        if self.expected.get(self.written..end) != Some(bytes) {
             return Err(Error::OffsetOutOfBounds);
         }
-        self.vec.write(bytes)
-    }
-
-    fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
-        let offset = offset
-            .checked_sub(self.start)
-            .ok_or(Error::OffsetOutOfBounds)?;
-        self.vec.write_at(offset, bytes)
+        self.written = end;
+        Ok(())
     }
 }
 
@@ -369,6 +372,7 @@ mod tests {
     use super::*;
     use crate::Format;
     use crate::endianity::LittleEndian;
+    use crate::write::EndianVec;
 
     fn roundtrip(data: &[u8], offsets: &[usize], format: Format) -> GccExceptTable {
         let bases = BaseAddresses::default().set_section(0x4000);

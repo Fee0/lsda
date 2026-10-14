@@ -62,16 +62,14 @@ fn read_everything<R: Reader>(table: &GccExceptTable<R>, offset: usize, rng: &mu
     let _ = lsda.ttype_entry_size();
     let mut call_sites = lsda.call_sites();
     while let Ok(Some(call_site)) = call_sites.next() {
-        if let Some(action) = call_site.action
-            && let Ok(mut actions) = lsda.actions(action)
-        {
+        if let Some(action) = call_site.action {
+            let mut actions = lsda.actions(action);
             while let Ok(Some(_)) = actions.next() {}
         }
     }
     let _ = lsda.find_call_site(rng.below(0x200));
-    if let Ok(mut actions) = lsda.actions(ActionOffset(rng.below(64) as usize)) {
-        while let Ok(Some(_)) = actions.next() {}
-    }
+    let mut actions = lsda.actions(ActionOffset(rng.below(64) as usize));
+    while let Ok(Some(_)) = actions.next() {}
     if let Ok(pointer) = lsda.type_entry(rng.below(8)) {
         let _ = pointer.address(&bases);
     }
@@ -173,12 +171,8 @@ fn load_fixtures() -> Vec<(Vec<u8>, Vec<usize>, Format, RunTimeEndian)> {
         let data = std::fs::read(&path).unwrap();
         let file = object::File::parse(&*data).unwrap();
         let section = elf::load(&file).unwrap();
-        fixtures.push((
-            section.relocated.clone(),
-            section.offsets().iter().map(|o| o.0).collect(),
-            section.format,
-            section.endian,
-        ));
+        let offsets = section.offsets().iter().map(|o| o.0).collect();
+        fixtures.push((section.relocated, offsets, section.format, section.endian));
     }
     assert_ne!(fixtures.len(), 0, "no fixtures");
     fixtures

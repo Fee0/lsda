@@ -73,10 +73,6 @@ impl<T: RelocateWriter> Writer for T {
         self.writer_mut().write(bytes)
     }
 
-    fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
-        self.writer_mut().write_at(offset, bytes)
-    }
-
     fn write_pointer(
         &mut self,
         encoding: Encoding,
@@ -95,9 +91,7 @@ impl<T: RelocateWriter> Writer for T {
             DW_EH_PE_PCREL => RelocationKind::Relative,
             _ => return Err(Error::UnsupportedRelocationEncoding(encoding)),
         };
-        let size =
-            field_size(encoding, format)?.ok_or(Error::UnsupportedRelocationEncoding(encoding))?;
-        write_relocation(self, size, kind, symbol, addend, encoding, format)
+        write_relocation(self, kind, symbol, addend, encoding, format)
     }
 
     fn write_type_info(
@@ -109,11 +103,8 @@ impl<T: RelocateWriter> Writer for T {
     ) -> Result<()> {
         match address {
             Address::Symbol { symbol, addend } if format.unwinder == Unwinder::ArmEhabi => {
-                let size = field_size(encoding, format)?
-                    .ok_or(Error::UnsupportedRelocationEncoding(encoding))?;
                 write_relocation(
                     self,
-                    size,
                     RelocationKind::Target2,
                     symbol,
                     addend,
@@ -128,13 +119,14 @@ impl<T: RelocateWriter> Writer for T {
 
 fn write_relocation<T: RelocateWriter + ?Sized>(
     w: &mut T,
-    size: u8,
     kind: RelocationKind,
     symbol: usize,
     addend: i64,
     encoding: Encoding,
     format: Format,
 ) -> Result<()> {
+    let size =
+        field_size(encoding, format)?.ok_or(Error::UnsupportedRelocationEncoding(encoding))?;
     if encoding.application() == DW_EH_PE_ALIGNED {
         w.writer_mut().align(u32::from(format.address_size))?;
     }

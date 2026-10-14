@@ -84,11 +84,7 @@ impl<'data> LsdaSection<'data> {
 
     /// Return the name of the symbol at `address`, if any.
     pub fn symbol_name(&self, address: u64) -> Option<&str> {
-        let index = self.symbols.partition_point(|(a, _)| *a < address);
-        self.symbols
-            .get(index)
-            .filter(|(a, _)| *a == address)
-            .map(|(_, name)| name.as_str())
+        symbol_at(&self.symbols, address)
     }
 
     /// Name the `type_info` object that a type table entry refers to, if
@@ -115,6 +111,15 @@ impl<'data> LsdaSection<'data> {
             None => format!("0x{address:x}"),
         }
     }
+}
+
+/// Return the name of the symbol at `address` in a sorted symbol list.
+fn symbol_at(symbols: &[(u64, String)], address: u64) -> Option<&str> {
+    let index = symbols.partition_point(|(a, _)| *a < address);
+    symbols
+        .get(index)
+        .filter(|(a, _)| *a == address)
+        .map(|(_, name)| name.as_str())
 }
 
 /// Applies relocations, using a synthetic layout in which every section of
@@ -334,11 +339,7 @@ pub fn load<'data>(file: &object::File<'data>) -> Option<LsdaSection<'data>> {
         } else {
             lsda.function
         };
-        let index = symbols.partition_point(|(a, _)| *a < function);
-        lsda.name = symbols
-            .get(index)
-            .filter(|(a, _)| *a == function)
-            .map(|(_, name)| name.clone());
+        lsda.name = symbol_at(&symbols, function).map(str::to_string);
     }
     lsdas.sort_by_key(|lsda| lsda.offset);
 

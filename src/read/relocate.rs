@@ -127,11 +127,7 @@ where
         let offset = self.reader.offset_from(&self.section);
         let value = self.reader.read_sized(size)?;
         let value = self.relocate.relocate(offset, size, value)?;
-        Ok(if size >= 8 {
-            value
-        } else {
-            value & ((1u64 << (u32::from(size) * 8)) - 1)
-        })
+        Ok(value & crate::common::size_mask(size))
     }
 
     #[inline]

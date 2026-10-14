@@ -1,9 +1,10 @@
 use alloc::vec::Vec;
 
+use crate::common::{ARM_SPEC_ENTRY_SIZE, padding};
 use crate::common::{BaseAddresses, Encoding, Format, LsdaOffset, Unwinder};
 use crate::constants::*;
 use crate::leb128;
-use crate::write::writer::{field_size, padding};
+use crate::write::writer::{check_alignment, field_size, read_back, write_raw};
 use crate::write::{Address, EndianVec, Error, Result, Writer};
 
 /// A table of LSDAs, which can be written to `.gcc_except_table`.
@@ -328,7 +329,7 @@ impl Lsda {
         } else {
             0
         };
-        padding(0, self.type_table_alignment)?;
+        let type_table_alignment = check_alignment(self.type_table_alignment)?;
 
         let spec_offsets = self.spec_offsets(arm)?;
         let (actions, action_offsets) = self.encode_actions(w, &spec_offsets)?;
@@ -356,7 +357,7 @@ impl Lsda {
             let value = loop {
                 let after = field + len;
                 types_start = after + body_len;
-                types_start += padding(types_start, self.type_table_alignment)?;
+                types_start += padding(types_start, type_table_alignment);
                 let base = types_start + self.types.len() * type_size;
                 let value = (base - after) as u64;
                 let needed = leb128::unsigned_len(value);
@@ -376,9 +377,8 @@ impl Lsda {
             return Ok(());
         }
 
-        while w.len() < types_start {
-            w.write_u8(0)?;
-        }
+        w.align(self.type_table_alignment)?;
+        debug_assert_eq!(w.len(), types_start);
         for type_info in self.types.iter().rev() {
             let address = type_info.unwrap_or(Address::Constant(0));
             w.write_type_info(self.ttype_encoding, address, format, bases)?;
@@ -392,8 +392,10 @@ impl Lsda {
                     w.write_u8(0)?;
                 }
                 ExceptionSpec::TypeInfos(type_infos) => {
+                    let encoding = Encoding::UDATA4;
+                    debug_assert_eq!(encoding.size(4), Some(ARM_SPEC_ENTRY_SIZE));
                     for address in type_infos {
-                        w.write_type_info(Encoding::UDATA4, *address, format, bases)?;
+                        w.write_type_info(encoding, *address, format, bases)?;
                     }
                     w.write_u32(0)?;
                 }
@@ -462,15 +464,17 @@ impl Lsda {
         // displacements. Grow the fields until they are stable; a field
         // whose value then needs fewer bytes is padded.
         let mut disp_lens = alloc::vec![1; self.actions.len()];
-        let (offsets, displacements) = loop {
-            let mut offsets = Vec::with_capacity(self.actions.len());
+        let mut offsets = Vec::with_capacity(self.actions.len());
+        let mut displacements = Vec::with_capacity(self.actions.len());
+        loop {
+            offsets.clear();
+            displacements.clear();
             let mut offset = 0;
             for (filter, disp_len) in filters.iter().zip(&disp_lens) {
                 offsets.push(offset);
                 offset += leb128::signed_len(*filter) + disp_len;
             }
             let mut changed = false;
-            let mut displacements = Vec::with_capacity(self.actions.len());
             for (i, action) in self.actions.iter().enumerate() {
                 let displacement = action.next.map_or(0, |next| {
                     let place = offsets[i] + leb128::signed_len(filters[i]);
@@ -484,9 +488,9 @@ impl Lsda {
                 displacements.push(displacement);
             }
             if !changed {
-                break (offsets, displacements);
+                break;
             }
-        };
+        }
 
         let mut bytes = EndianVec::new(w.endian());
         for ((filter, displacement), disp_len) in filters.iter().zip(displacements).zip(disp_lens) {
@@ -504,40 +508,23 @@ impl Lsda {
         action_offsets: &[usize],
     ) -> Result<Vec<u8>> {
         let sjlj = format.unwinder == Unwinder::SjLj;
-        let encoding = self.call_site_encoding;
-        let size = if sjlj {
-            None
+        // The SJLJ personality reads ULEB128 values whatever the encoding.
+        let encoding = if sjlj {
+            Encoding::ULEB128
         } else {
-            let size = field_size(encoding, format)
-                .map_err(|_| Error::UnsupportedCallSiteEncoding(encoding))?;
-            if encoding.application() != DW_EH_PE_ABSPTR {
-                return Err(Error::UnsupportedCallSiteEncoding(encoding));
-            }
-            size
+            self.call_site_encoding
         };
+        let size = field_size(encoding, format)
+            .map_err(|_| Error::UnsupportedCallSiteEncoding(encoding))?;
+        if encoding.application() != DW_EH_PE_ABSPTR {
+            return Err(Error::UnsupportedCallSiteEncoding(encoding));
+        }
         let mut bytes = EndianVec::new(w.endian());
-        let value = |bytes: &mut EndianVec<W::Endian>, value: u64| match size {
-            Some(size) => {
-                let mask = if size >= 8 {
-                    u64::MAX
-                } else {
-                    (1u64 << (u32::from(size) * 8)) - 1
-                };
-                let fits = if encoding.is_signed() {
-                    let shift = 64 - u32::from(size) * 8;
-                    ((value << shift).cast_signed() >> shift).cast_unsigned() == value
-                } else {
-                    value & mask == value
-                };
-                if !fits {
-                    return Err(Error::ValueOutOfRange(value));
-                }
-                bytes.write_sized(value, size)
+        let value = |bytes: &mut EndianVec<W::Endian>, value: u64| {
+            if read_back(encoding, value, size) != value {
+                return Err(Error::ValueOutOfRange(value));
             }
-            None if encoding.format() == DW_EH_PE_SLEB128 && !sjlj => {
-                bytes.write_sleb128(value.cast_signed(), 0)
-            }
-            None => bytes.write_uleb128(value, 0),
+            write_raw(bytes, encoding, value, size)
         };
         for call_site in &self.call_sites {
             if !sjlj {
@@ -707,7 +694,6 @@ mod tests {
         let parsed = table.lsda_at(LsdaOffset(0)).unwrap();
         let chain: Vec<_> = parsed
             .actions(read::ActionOffset(0))
-            .unwrap()
             .map(|a| a.unwrap().offset.0)
             .collect();
         assert_eq!(chain, [0, 3 + 68 * 2, 3]);

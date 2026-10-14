@@ -1,4 +1,4 @@
-use crate::common::{Base, BaseAddresses, Encoding, Format, application_base};
+use crate::common::{BaseAddresses, Encoding, Format, padding, sign_extend, size_mask};
 use crate::constants::*;
 use crate::endianity::Endianity;
 use crate::leb128;
@@ -27,16 +27,6 @@ pub trait Writer {
     ///
     /// Returns an error if the writer cannot store the bytes.
     fn write(&mut self, bytes: &[u8]) -> Result<()>;
-
-    /// Write a slice at a given offset.
-    ///
-    /// The write must not extend past the current section length.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::OffsetOutOfBounds`] if the write extends past the
-    /// current section length.
-    fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<()>;
 
     /// Write an encoded pointer to `address`.
     ///
@@ -159,18 +149,7 @@ pub trait Writer {
     ///
     /// Returns the errors of [`write`](Self::write).
     fn write_uleb128(&mut self, val: u64, len: usize) -> Result<()> {
-        let mut bytes = [0; 16];
-        let mut count = 0;
-        if len > bytes.len() {
-            let mut vec = alloc::vec::Vec::new();
-            leb128::write_unsigned_padded(val, len, |b| vec.push(b));
-            return self.write(&vec);
-        }
-        leb128::write_unsigned_padded(val, len, |b| {
-            bytes[count] = b;
-            count += 1;
-        });
-        self.write(&bytes[..count])
+        write_bytes(self, |out| leb128::write_unsigned_padded(val, len, out))
     }
 
     /// Write a signed LEB128 value in at least `len` bytes; 0 writes the
@@ -180,18 +159,7 @@ pub trait Writer {
     ///
     /// Returns the errors of [`write`](Self::write).
     fn write_sleb128(&mut self, val: i64, len: usize) -> Result<()> {
-        let mut bytes = [0; 16];
-        let mut count = 0;
-        if len > bytes.len() {
-            let mut vec = alloc::vec::Vec::new();
-            leb128::write_signed_padded(val, len, |b| vec.push(b));
-            return self.write(&vec);
-        }
-        leb128::write_signed_padded(val, len, |b| {
-            bytes[count] = b;
-            count += 1;
-        });
-        self.write(&bytes[..count])
+        write_bytes(self, |out| leb128::write_signed_padded(val, len, out))
     }
 
     /// Write zero bytes until the length is a multiple of `alignment`.
@@ -201,7 +169,7 @@ pub trait Writer {
     /// Returns [`Error::InvalidAlignment`] if `alignment` is not a power of
     /// two, and the errors of [`write`](Self::write).
     fn align(&mut self, alignment: u32) -> Result<()> {
-        let padding = padding(self.len(), alignment)?;
+        let padding = padding(self.len(), check_alignment(alignment)?);
         for _ in 0..padding {
             self.write_u8(0)?;
         }
@@ -209,13 +177,27 @@ pub trait Writer {
     }
 }
 
-/// Return the number of bytes needed to align `offset` to `alignment`.
-pub(crate) fn padding(offset: usize, alignment: u32) -> Result<usize> {
-    if !alignment.is_power_of_two() {
-        return Err(Error::InvalidAlignment(alignment));
+/// Write the bytes produced by `encode`, stopping at the first error.
+fn write_bytes<W: Writer + ?Sized>(
+    w: &mut W,
+    encode: impl FnOnce(&mut dyn FnMut(u8)),
+) -> Result<()> {
+    let mut result = Ok(());
+    encode(&mut |byte| {
+        if result.is_ok() {
+            result = w.write_u8(byte);
+        }
+    });
+    result
+}
+
+/// Return `alignment` as a `usize`, or an error if it is not a power of two.
+pub(crate) fn check_alignment(alignment: u32) -> Result<usize> {
+    if alignment.is_power_of_two() {
+        Ok(alignment as usize)
+    } else {
+        Err(Error::InvalidAlignment(alignment))
     }
-    let alignment = alignment as usize;
-    Ok(offset.wrapping_neg() & (alignment - 1))
 }
 
 /// Return the field size of a fixed-size encoding, or `None` for LEB128.
@@ -223,23 +205,19 @@ pub(crate) fn field_size(encoding: Encoding, format: Format) -> Result<Option<u8
     if !encoding.is_valid() {
         return Err(Error::InvalidEncoding(encoding));
     }
-    if !matches!(format.address_size, 2 | 4 | 8) {
+    if !format.has_valid_address_size() {
         return Err(Error::UnsupportedAddressSize(format.address_size));
     }
     Ok(encoding.size(format.address_size))
 }
 
-/// Sign-extend the low `size` bytes of `value`.
-fn sign_extend(value: u64, size: u8) -> u64 {
-    let shift = 64 - u32::from(size) * 8;
-    ((value << shift).cast_signed() >> shift).cast_unsigned()
-}
-
-fn size_mask(size: u8) -> u64 {
-    if size >= 8 {
-        u64::MAX
-    } else {
-        (1u64 << (u32::from(size) * 8)) - 1
+/// Return the value that reading the field of `raw` written in `encoding`
+/// (of `size` bytes, or LEB128) gives back.
+pub(crate) fn read_back(encoding: Encoding, raw: u64, size: Option<u8>) -> u64 {
+    match size {
+        Some(size) if encoding.is_signed() => sign_extend(raw & size_mask(size), size),
+        Some(size) => raw & size_mask(size),
+        None => raw,
     }
 }
 
@@ -260,17 +238,9 @@ pub(crate) fn write_constant_pointer<W: Writer + ?Sized>(
     if value == 0 {
         return write_raw(w, encoding, 0, size);
     }
-    let base = match application_base(encoding.application()) {
-        Some(base) => {
-            let address = bases.get(base).ok_or(Error::MissingBaseAddress(base))?;
-            if base == Base::Section {
-                address.wrapping_add(w.len() as u64)
-            } else {
-                address
-            }
-        }
-        None => 0,
-    };
+    let base = bases
+        .relative_base(encoding, w.len())
+        .map_err(Error::MissingBaseAddress)?;
     let mut raw = value.wrapping_sub(base) & mask;
     if encoding.format() == DW_EH_PE_SLEB128 {
         // Keep negative offsets short.
@@ -278,11 +248,7 @@ pub(crate) fn write_constant_pointer<W: Writer + ?Sized>(
     }
     // Check that reading the field back gives the same address, and is not
     // mistaken for a null pointer.
-    let read_back = match size {
-        Some(size) if encoding.is_signed() => sign_extend(raw & size_mask(size), size),
-        Some(size) => raw & size_mask(size),
-        None => raw,
-    };
+    let read_back = read_back(encoding, raw, size);
     if read_back == 0 || read_back.wrapping_add(base) & mask != value {
         return Err(Error::PointerOutOfRange(value));
     }
@@ -306,6 +272,7 @@ pub(crate) fn write_raw<W: Writer + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Base;
     use crate::endianity::LittleEndian;
     use crate::write::EndianVec;
 

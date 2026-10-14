@@ -229,15 +229,51 @@ impl Format {
     }
 
     /// Return a mask of the low `address_size * 8` bits.
-    #[cfg(any(feature = "read", feature = "write"))]
+    #[cfg(feature = "write")]
     #[inline]
     pub(crate) fn address_mask(self) -> u64 {
-        if self.address_size >= 8 {
-            u64::MAX
-        } else {
-            (1u64 << (u32::from(self.address_size) * 8)) - 1
-        }
+        size_mask(self.address_size)
     }
+
+    /// Return true if the address size is supported: 2, 4 or 8.
+    #[cfg(any(feature = "read", feature = "write"))]
+    #[inline]
+    pub(crate) fn has_valid_address_size(self) -> bool {
+        matches!(self.address_size, 2 | 4 | 8)
+    }
+}
+
+/// The size of an Arm EHABI exception specification entry: a `_uleb128_t`,
+/// which is a 32-bit word in libgcc's Arm unwinder.
+#[cfg(any(feature = "read", feature = "write"))]
+pub(crate) const ARM_SPEC_ENTRY_SIZE: u8 = 4;
+
+/// Return a mask of the low `size` bytes.
+#[cfg(any(feature = "read", feature = "write"))]
+#[inline]
+pub(crate) fn size_mask(size: u8) -> u64 {
+    if size >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (u32::from(size) * 8)) - 1
+    }
+}
+
+/// Sign-extend the low `size` bytes of `value`.
+#[cfg(any(feature = "read", feature = "write"))]
+#[inline]
+pub(crate) fn sign_extend(value: u64, size: u8) -> u64 {
+    let shift = 64 - u32::from(size) * 8;
+    ((value << shift).cast_signed() >> shift).cast_unsigned()
+}
+
+/// Return the number of bytes needed to align `offset` to `alignment`, which
+/// must be a power of two.
+#[cfg(any(feature = "read", feature = "write"))]
+#[inline]
+pub(crate) fn padding(offset: usize, alignment: usize) -> usize {
+    debug_assert!(alignment.is_power_of_two());
+    offset.wrapping_neg() & (alignment - 1)
 }
 
 /// The base addresses that relative pointer encodings are resolved against.
@@ -329,22 +365,31 @@ impl fmt::Display for Base {
     }
 }
 
-/// Return the base address that a pointer with the given application is
-/// relative to, or `None` for absolute applications.
-#[cfg(any(feature = "read", feature = "write"))]
-pub(crate) fn application_base(application: u8) -> Option<Base> {
-    match application {
-        DW_EH_PE_PCREL => Some(Base::Section),
-        DW_EH_PE_TEXTREL => Some(Base::Text),
-        DW_EH_PE_DATAREL => Some(Base::Data),
-        DW_EH_PE_FUNCREL => Some(Base::Function),
-        _ => None,
+impl BaseAddresses {
+    /// Return the address that a pointer field with the given encoding at
+    /// `offset` in the section is relative to: 0 for absolute pointers, or
+    /// the base for its application (plus `offset` for `DW_EH_PE_pcrel`).
+    #[cfg(any(feature = "read", feature = "write"))]
+    pub(crate) fn relative_base(&self, encoding: Encoding, offset: usize) -> Result<u64, Base> {
+        let base = match encoding.application() {
+            DW_EH_PE_PCREL => Base::Section,
+            DW_EH_PE_TEXTREL => Base::Text,
+            DW_EH_PE_DATAREL => Base::Data,
+            DW_EH_PE_FUNCREL => Base::Function,
+            _ => return Ok(0),
+        };
+        let address = self.get(base).ok_or(base)?;
+        Ok(if base == Base::Section {
+            address.wrapping_add(offset as u64)
+        } else {
+            address
+        })
     }
 }
 
 /// An offset into the section that holds the LSDAs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LsdaOffset<T = usize>(pub T);
+pub struct LsdaOffset(pub usize);
 
 #[cfg(test)]
 mod tests {
@@ -375,8 +420,16 @@ mod tests {
 
     #[test]
     #[cfg(any(feature = "read", feature = "write"))]
-    fn test_address_mask() {
-        assert_eq!(Format::new(4).address_mask(), 0xffff_ffff);
-        assert_eq!(Format::new(8).address_mask(), u64::MAX);
+    fn test_helpers() {
+        assert_eq!(size_mask(4), 0xffff_ffff);
+        assert_eq!(size_mask(8), u64::MAX);
+        assert_eq!(sign_extend(0xfffc, 2), (-4i64).cast_unsigned());
+        assert_eq!(sign_extend(0x7ffc, 2), 0x7ffc);
+        assert_eq!(padding(5, 4), 3);
+        assert_eq!(padding(8, 8), 0);
+        let bases = BaseAddresses::default().set_section(0x1000);
+        assert_eq!(bases.relative_base(Encoding::PCREL_SDATA4, 4), Ok(0x1004));
+        assert_eq!(bases.relative_base(Encoding::ABSPTR, 4), Ok(0));
+        assert_eq!(bases.relative_base(Encoding(0x23), 4), Err(Base::Text));
     }
 }

@@ -2,6 +2,7 @@ use alloc::borrow::Cow;
 use core::fmt::Debug;
 
 use crate::endianity::Endianity;
+use crate::leb128;
 use crate::read::{Error, Result};
 
 /// A trait for reading the data from a section that holds LSDAs.
@@ -164,26 +165,11 @@ pub trait Reader: Debug + Clone {
     /// Returns [`Error::BadUnsignedLeb128`] if the value does not fit in a
     /// `u64`, and [`Error::UnexpectedEof`] if it is truncated.
     fn read_uleb128(&mut self) -> Result<u64> {
-        let mut result = 0u64;
-        let mut shift = 0u32;
-        loop {
-            let byte = self.read_u8()?;
-            let low = u64::from(byte & 0x7f);
-            if shift >= 64 {
-                if low != 0 {
-                    return Err(Error::BadUnsignedLeb128);
-                }
-            } else {
-                if shift == 63 && low > 1 {
-                    return Err(Error::BadUnsignedLeb128);
-                }
-                result |= low << shift;
-            }
-            if byte & 0x80 == 0 {
-                return Ok(result);
-            }
-            shift += 7;
-        }
+        read_leb128(
+            self,
+            |bytes| leb128::read_unsigned(bytes),
+            Error::BadUnsignedLeb128,
+        )
     }
 
     /// Read a signed LEB128 value.
@@ -193,30 +179,11 @@ pub trait Reader: Debug + Clone {
     /// Returns [`Error::BadSignedLeb128`] if the value does not fit in an
     /// `i64`, and [`Error::UnexpectedEof`] if it is truncated.
     fn read_sleb128(&mut self) -> Result<i64> {
-        let mut result = 0i64;
-        let mut shift = 0u32;
-        loop {
-            let byte = self.read_u8()?;
-            let low = i64::from(byte & 0x7f);
-            if shift >= 64 {
-                let sign = if result < 0 { 0x7f } else { 0 };
-                if low != sign {
-                    return Err(Error::BadSignedLeb128);
-                }
-            } else {
-                if shift == 63 && low != 0 && low != 0x7f {
-                    return Err(Error::BadSignedLeb128);
-                }
-                result |= low << shift;
-            }
-            shift += 7;
-            if byte & 0x80 == 0 {
-                if shift < 64 && byte & 0x40 != 0 {
-                    result |= -1i64 << shift;
-                }
-                return Ok(result);
-            }
-        }
+        read_leb128(
+            self,
+            |bytes| leb128::read_signed(bytes),
+            Error::BadSignedLeb128,
+        )
     }
 
     /// Return a reader for the data starting at `offset`, without changing
@@ -231,6 +198,26 @@ pub trait Reader: Debug + Clone {
         let mut reader = self.clone();
         reader.skip(offset)?;
         Ok(reader)
+    }
+}
+
+/// Decode a LEB128 value with one of the [`leb128`] decoders, which return
+/// `None` both at the end of input and on overflow.
+fn read_leb128<R: Reader, T>(
+    reader: &mut R,
+    decode: impl FnOnce(&mut dyn Iterator<Item = u8>) -> Option<T>,
+    overflow: Error,
+) -> Result<T> {
+    let mut eof = false;
+    let mut bytes = core::iter::from_fn(|| {
+        let byte = reader.read_u8().ok();
+        eof = byte.is_none();
+        byte
+    });
+    match decode(&mut bytes) {
+        Some(value) => Ok(value),
+        None if eof => Err(Error::UnexpectedEof),
+        None => Err(overflow),
     }
 }
 

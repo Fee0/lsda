@@ -4,7 +4,7 @@
 ///
 /// Returns `None` if the iterator ends before the value does, or if the value
 /// does not fit in a `u64`. Redundant high zero groups are accepted.
-pub fn read_unsigned<I: Iterator<Item = u8>>(bytes: &mut I) -> Option<u64> {
+pub fn read_unsigned<I: Iterator<Item = u8> + ?Sized>(bytes: &mut I) -> Option<u64> {
     let mut result = 0u64;
     let mut shift = 0u32;
     loop {
@@ -32,7 +32,7 @@ pub fn read_unsigned<I: Iterator<Item = u8>>(bytes: &mut I) -> Option<u64> {
 ///
 /// Returns `None` if the iterator ends before the value does, or if the value
 /// does not fit in an `i64`. Redundant sign groups are accepted.
-pub fn read_signed<I: Iterator<Item = u8>>(bytes: &mut I) -> Option<i64> {
+pub fn read_signed<I: Iterator<Item = u8> + ?Sized>(bytes: &mut I) -> Option<i64> {
     let mut result = 0i64;
     let mut shift = 0u32;
     loop {
