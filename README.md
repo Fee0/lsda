@@ -179,34 +179,67 @@ its LSDAs, for modification and rewriting.
 ### With `ehabi` (Arm EHABI)
 
 On 32-bit Arm the LSDA ends a generic-model `.ARM.extab` entry. The
-[`ehabi`](https://crates.io/crates/ehabi) crate finds it, and this crate
-decodes it:
+[`ehabi`](https://crates.io/crates/ehabi) crate reads and writes those
+tables, and with its `lsda` feature it uses this crate for the LSDA:
 
-```rust
-use ehabi::read::{ExIdx, ExTab, UnwindEntry};
-
-let exidx = ExIdx::new(exidx_data, ehabi::LittleEndian);
-let extab = ExTab::new(extab_data, ehabi::LittleEndian);
-let lsdas = lsda::read::GccExceptTable::new(extab_data, lsda::LittleEndian, Format::arm_ehabi());
-let mut entries = exidx.entries();
-while let Some(entry) = entries.next()? {
-    if let UnwindEntry::Generic(generic) = entry.resolve(&extab, &ehabi_bases)? {
-        let offset = generic.gnu_lsda_offset()?;
-        let lsda = lsdas.lsda_at(LsdaOffset(offset.0))?;
-        // ...
-    }
-}
+```toml
+[dependencies]
+ehabi = { version = "0.2", features = ["lsda"] }
+lsda = "0.1"
 ```
 
-To edit LSDAs, convert the tables with `ehabi::write::UnwindTable::from_read`,
-and rewrite the bytes of each `GenericData::Gnu` LSDA with this crate. GCC's
-`@TType` encoding is pc-relative, so read and write each LSDA with
-`bases.section` set to the address of the LSDA itself: the `.ARM.extab`
-address plus its `gnu_lsda_offset`, not the offset of its entry, which is
-8 + 4 × N bytes earlier for N words of unwinding instructions. `from_read`
-keeps every entry in place; if an edit moves entries, write the table and read
-it back to find where each LSDA ends up. `tests/ehabi.rs` checks both crates
-together on every Arm LSDA of the corpus.
+```rust
+use ehabi::read::UnwindEntry;
+use ehabi::write::{ExTabEntry, GenericData, IndexEntryData, UnwindTable};
+
+// Each LSDA, parsed in place in `.ARM.extab`.
+let mut entries = exidx.entries();
+while let Some(entry) = entries.next()? {
+    if let UnwindEntry::Generic(generic) = entry.resolve(&extab, &bases)? {
+        let lsda = generic.parse_gnu_lsda()?;
+        for call_site in lsda.parse_tables()?.call_sites {
+            println!("landing pad +{:#x}", call_site.landing_pad);
+        }
+    }
+}
+
+// Edit: the tables with each LSDA as an `lsda::write::Lsda`.
+let mut table = UnwindTable::from_read_with_lsdas(&exidx, &extab, &bases)?;
+let ids: Vec<_> = table
+    .index_entries()
+    .iter()
+    .filter_map(|entry| match entry.data {
+        IndexEntryData::ExTab(id) => Some(id),
+        _ => None,
+    })
+    .collect();
+for id in ids {
+    if let ExTabEntry::Generic(generic) = table.extab_entry_mut(id) {
+        if let GenericData::GnuLsda { lsda, .. } = &mut generic.data {
+            for call_site in &mut lsda.call_sites {
+                call_site.landing_pad += 4;
+            }
+        }
+    }
+}
+table.write(&mut sections, &bases)?;
+```
+
+- The LSDA is read in place, so its offsets are offsets in `.ARM.extab`:
+  resolve its pointers with `lsda::BaseAddresses` whose section address is
+  that of `.ARM.extab`. Relocations that an `ehabi::read::RelocateReader`
+  applies reach its type references too.
+- `from_read_with_lsdas` converts an LSDA to a model if it writes back
+  exactly, and otherwise keeps it as bytes (`GenericData::Gnu`).
+- A model is written where its entry ends up, so GCC's pc-relative `@TType`
+  references stay correct when entries move, and symbol references to
+  `type_info` objects become `R_ARM_TARGET2` relocations.
+
+Without the feature, `ehabi` gives the offset of each LSDA
+(`GenericEntry::gnu_lsda_offset`) and its bytes (`GenericData::Gnu`). Use
+this crate directly with `bases.section` set to the address of the LSDA
+itself, not of its entry: GCC's `@TType` encoding is pc-relative.
+`tests/ehabi.rs` checks both crates together on every Arm LSDA of the corpus.
 
 ### Dumping an ELF file
 
