@@ -176,6 +176,35 @@ is also stored in the field, as REL relocations require.
 `GccExceptTable::from_read` converts a parsed section, given the offsets of
 its LSDAs, for modification and rewriting.
 
+### With `ehabi` (Arm EHABI)
+
+On 32-bit Arm the LSDA ends a generic-model `.ARM.extab` entry. The
+[`ehabi`](https://crates.io/crates/ehabi) crate finds it, and this crate
+decodes it:
+
+```rust
+use ehabi::read::{ExIdx, ExTab, UnwindEntry};
+
+let exidx = ExIdx::new(exidx_data, ehabi::LittleEndian);
+let extab = ExTab::new(extab_data, ehabi::LittleEndian);
+let lsdas = lsda::read::GccExceptTable::new(extab_data, lsda::LittleEndian, Format::arm_ehabi());
+let mut entries = exidx.entries();
+while let Some(entry) = entries.next()? {
+    if let UnwindEntry::Generic(generic) = entry.resolve(&extab, &ehabi_bases)? {
+        let offset = generic.gnu_lsda_offset()?;
+        let lsda = lsdas.lsda_at(LsdaOffset(offset.0))?;
+        // ...
+    }
+}
+```
+
+To edit LSDAs, convert the tables with `ehabi::write::UnwindTable::from_read`,
+and rewrite the bytes of each `GenericData::Gnu` LSDA with this crate. GCC's
+`@TType` encoding is pc-relative, so write each LSDA with `bases.section` set
+to its address in the output `.ARM.extab`: `UnwindTable::write` returns the
+offsets of the entries. `tests/ehabi.rs` checks both crates together on every
+Arm LSDA of the corpus.
+
 ### Dumping an ELF file
 
 ```sh
